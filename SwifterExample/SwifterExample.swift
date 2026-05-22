@@ -18,7 +18,7 @@ struct SwifterExample {
 
         let semaphore = DispatchSemaphore(value: 0)
         do {
-            try await server.start(9080, forceIPv4: true)
+            try await server.startAsync(9080, forceIPv4: true)
             print("Server has started ( port = \(try server.port()) ). Try to connect now...")
             semaphore.wait()
         } catch {

@@ -80,12 +80,32 @@ open class HttpServerIO: @unchecked Sendable {
     /// 内部 flag —— 记录上次 start 是否 forceIPv4
     private var forceIPv4Active: Bool = false
 
-    /// 启动服务。
+    /// Sync 包装 —— 跑 async start 然后 semaphore 等结果。
+    /// 用于无 async 上下文的调用方(scripting-ios JSHttpServer 等)。等待时间通常 < 100ms。
+    /// async 调用方应直接调用 `startAsync(_:forceIPv4:tls:)` 避免阻塞当前线程。
+    public func start(_ port: in_port_t = 8080, forceIPv4: Bool = false, tls: TLSConfig? = nil) throws {
+        let semaphore = DispatchSemaphore(value: 0)
+        let box = ErrorBox()
+        Task.detached { [box, self] in
+            do {
+                try await self.startAsync(port, forceIPv4: forceIPv4, tls: tls)
+            } catch {
+                box.error = error
+            }
+            semaphore.signal()
+        }
+        semaphore.wait()
+        if let error = box.error {
+            throw error
+        }
+    }
+
+    /// 启动服务(async)。
     /// - Parameters:
     ///   - port: 监听端口;0 表示交由系统分配
     ///   - forceIPv4: true 时强制 IPv4 bind;false 时允许双栈
     ///   - tls: 非 nil 时启用 HTTPS;由 TLSConfig 提供 server identity
-    public func start(_ port: in_port_t = 8080, forceIPv4: Bool = false, tls: TLSConfig? = nil) async throws {
+    public func startAsync(_ port: in_port_t = 8080, forceIPv4: Bool = false, tls: TLSConfig? = nil) async throws {
         guard !self.operating else { return }
         stop()
         self.state = .starting
@@ -347,6 +367,11 @@ open class HttpServerIO: @unchecked Sendable {
 public enum HttpServerError: Error, Sendable {
     case bindFailed(String)
     case notRunning
+}
+
+/// sync wrapper 用的 boxed error
+private final class ErrorBox: @unchecked Sendable {
+    var error: Error?
 }
 
 // MARK: - Listener-ready async helper
