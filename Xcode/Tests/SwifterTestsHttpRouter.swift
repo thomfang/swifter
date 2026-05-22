@@ -9,6 +9,18 @@
 import XCTest
 @testable import Swifter
 
+/// 测试辅助:在 sync 测试里直接执行 HttpHandler。
+/// 路由本身改为 enum (sync/async) 之后,旧 callsite `handler?(request)` 不再直接可调,
+/// 改写为 `handler?.invokeSync(request)`。
+extension HttpHandler {
+    func invokeSync(_ request: HttpRequest) -> HttpResponse {
+        switch self {
+        case .sync(let h): return h(request)
+        case .async: fatalError("async handler invoked from sync test path")
+        }
+    }
+}
+
 class SwifterTestsHttpRouter: XCTestCase {
 
     var router: HttpRouter!
@@ -151,12 +163,12 @@ class SwifterTestsHttpRouter: XCTestCase {
         let staticRouteResult = router.route("GET", path: "a/b")
         let staticRouterHandler = staticRouteResult?.1
         XCTAssertNotNil(staticRouteResult)
-        _ = staticRouterHandler?(request)
+        _ = staticRouterHandler?.invokeSync(request)
 
         let variableRouteResult = router.route("GET", path: "a/b/c")
         let variableRouterHandler = variableRouteResult?.1
         XCTAssertNotNil(variableRouteResult)
-        _ = variableRouterHandler?(request)
+        _ = variableRouterHandler?.invokeSync(request)
 
         waitForExpectations(timeout: 10, handler: nil)
         XCTAssertTrue(foundStaticRoute)
@@ -186,12 +198,12 @@ class SwifterTestsHttpRouter: XCTestCase {
         let firstRouteResult = router.route("GET", path: "a/b")
         let firstRouterHandler = firstRouteResult?.1
         XCTAssertNotNil(firstRouteResult)
-        _ = firstRouterHandler?(request)
+        _ = firstRouterHandler?.invokeSync(request)
 
         let secondRouteResult = router.route("GET", path: "a/b/c")
         let secondRouterHandler = secondRouteResult?.1
         XCTAssertNotNil(secondRouteResult)
-        _ = secondRouterHandler?(request)
+        _ = secondRouterHandler?.invokeSync(request)
 
         waitForExpectations(timeout: 10, handler: nil)
         XCTAssertTrue(foundFirstVariableRoute)
@@ -229,17 +241,17 @@ class SwifterTestsHttpRouter: XCTestCase {
         let firstRouteResult = router.route("GET", path: "/a")
         let firstRouterHandler = firstRouteResult?.1
         XCTAssertNotNil(firstRouteResult)
-        _ = firstRouterHandler?(request)
+        _ = firstRouterHandler?.invokeSync(request)
 
         let secondRouteResult = router.route("GET", path: "/a/b")
         let secondRouterHandler = secondRouteResult?.1
         XCTAssertNotNil(secondRouteResult)
-        _ = secondRouterHandler?(request)
+        _ = secondRouterHandler?.invokeSync(request)
 
         let thirdRouteResult = router.route("GET", path: "/a/b/b")
         let thirdRouterHandler = thirdRouteResult?.1
         XCTAssertNotNil(thirdRouteResult)
-        _ = thirdRouterHandler?(request)
+        _ = thirdRouterHandler?.invokeSync(request)
 
         waitForExpectations(timeout: 10, handler: nil)
         XCTAssertTrue(foundFirstVariableRoute)
@@ -270,12 +282,12 @@ class SwifterTestsHttpRouter: XCTestCase {
         let firstRouteResult = router.route("GET", path: "/a/b/c/d/e")
         let firstRouterHandler = firstRouteResult?.1
         XCTAssertNotNil(firstRouteResult)
-        _ = firstRouterHandler?(request)
+        _ = firstRouterHandler?.invokeSync(request)
 
         let secondRouteResult = router.route("GET", path: "/a/b/f/g")
         let secondRouterHandler = secondRouteResult?.1
         XCTAssertNotNil(secondRouteResult)
-        _ = secondRouterHandler?(request)
+        _ = secondRouterHandler?.invokeSync(request)
 
         waitForExpectations(timeout: 10, handler: nil)
         XCTAssertTrue(foundFirstVariableRoute)

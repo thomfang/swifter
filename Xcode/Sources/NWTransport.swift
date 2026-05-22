@@ -139,6 +139,12 @@ public actor NWTransport: HttpTransport {
         }
     }
 
+    /// NWConnection.send 自身就是 thread-safe + 顺序保证(同 connection 多次 send 按调用顺序排队)。
+    /// 完成 callback 里的 error 丢弃 —— 写失败时调用方在下次 read 会拿到 disconnected。
+    public nonisolated func sendNonBlocking(_ data: ArraySlice<UInt8>) {
+        connection.send(content: Data(data), completion: .contentProcessed { _ in })
+    }
+
     // MARK: - Close
 
     public nonisolated func close() {

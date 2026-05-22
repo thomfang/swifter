@@ -36,32 +36,45 @@ open class HttpServer: HttpServerIO {
     public var DELETE, PATCH, HEAD, POST, GET, PUT: MethodRoute
     public var delete, patch, head, post, get, put: MethodRoute
 
-    public subscript(path: String) -> ((HttpRequest) -> HttpResponse)? {
+    /// 兼容旧 API:sync handler 通过 subscript 注册
+    public subscript(path: String) -> (@Sendable (HttpRequest) -> HttpResponse)? {
         get { return nil }
         set {
             router.register(nil, path: path, handler: newValue)
         }
     }
 
+    /// 注册 async handler(任意 method)
+    public func setAsync(_ path: String, handler: @escaping @Sendable (HttpRequest) async throws -> HttpResponse) {
+        router.register(nil, path: path, asyncHandler: handler)
+    }
+
     public var routes: [String] {
         return router.routes()
     }
 
-    public var notFoundHandler: ((HttpRequest) -> HttpResponse)?
+    /// 兼容旧 API:sync notFound
+    public var notFoundHandler: (@Sendable (HttpRequest) -> HttpResponse)?
 
-    public var middleware = [(HttpRequest) -> HttpResponse?]()
+    /// 新接口:async notFound;若设置,优先于 notFoundHandler
+    public var notFoundAsyncHandler: (@Sendable (HttpRequest) async throws -> HttpResponse)?
 
-    override open func dispatch(_ request: HttpRequest) -> ([String: String], (HttpRequest) -> HttpResponse) {
+    public var middleware = [@Sendable (HttpRequest) -> HttpResponse?]()
+
+    override open func dispatch(_ request: HttpRequest) -> ([String: String], HttpHandler) {
         for layer in middleware {
             if let response = layer(request) {
-                return ([:], { _ in response })
+                return ([:], .sync { _ in response })
             }
         }
         if let result = router.route(request.method, path: request.path) {
             return result
         }
+        if let asyncNotFound = self.notFoundAsyncHandler {
+            return ([:], .async(asyncNotFound))
+        }
         if let notFoundHandler = self.notFoundHandler {
-            return ([:], notFoundHandler)
+            return ([:], .sync(notFoundHandler))
         }
         return super.dispatch(request)
     }
@@ -69,11 +82,18 @@ open class HttpServer: HttpServerIO {
     public struct MethodRoute {
         public let method: String
         public let router: HttpRouter
-        public subscript(path: String) -> ((HttpRequest) -> HttpResponse)? {
+
+        /// 兼容旧 API:sync handler 通过 method subscript 注册
+        public subscript(path: String) -> (@Sendable (HttpRequest) -> HttpResponse)? {
             get { return nil }
             set {
                 router.register(method, path: path, handler: newValue)
             }
+        }
+
+        /// 注册 method 限定的 async handler
+        public func setAsync(_ path: String, handler: @escaping @Sendable (HttpRequest) async throws -> HttpResponse) {
+            router.register(method, path: path, asyncHandler: handler)
         }
     }
 }

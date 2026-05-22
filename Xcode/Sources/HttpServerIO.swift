@@ -1,23 +1,23 @@
 //
-//  HttpServer.swift
+//  HttpServerIO.swift
 //  Swifter
 //
 //  Copyright (c) 2014-2016 Damian Kołakowski. All rights reserved.
 //
 
 import Foundation
-import Dispatch
+import Network
 
-public protocol HttpServerIODelegate: AnyObject {
-    func socketConnectionReceived(_ socket: Socket)
+/// 上层(scripting-ios LocalServer 等)关心的连接生命周期事件 —— 切到
+/// transport 抽象之后,delegate 拿到的不是底层 socket,而是已经 upgrade
+/// 完成的 WebSocket transport(handleConnection 在交付 session 前回调)。
+public protocol HttpServerIODelegate: AnyObject, Sendable {
+    func transportConnectionReceived(_ transport: HttpTransport)
 }
 
-open class HttpServerIO {
+open class HttpServerIO: @unchecked Sendable {
 
     public weak var delegate: HttpServerIODelegate?
-
-    private var socket = Socket(socketFileDescriptor: -1)
-    private var sockets = Set<Socket>()
 
     public enum HttpServerIOState: Int32 {
         case starting
@@ -40,136 +40,254 @@ open class HttpServerIO {
     public var operating: Bool { return self.state == .running }
 
     /// String representation of the IPv4 address to receive requests from.
-    /// It's only used when the server is started with `forceIPv4` option set to true.
-    /// Otherwise, `listenAddressIPv6` will be used.
+    /// 当 forceIPv4 = true 时使用;否则用 listenAddressIPv6。
     public var listenAddressIPv4: String?
 
     /// String representation of the IPv6 address to receive requests from.
-    /// It's only used when the server is started with `forceIPv4` option set to false.
-    /// Otherwise, `listenAddressIPv4` will be used.
     public var listenAddressIPv6: String?
 
-    private let queue = DispatchQueue(label: "swifter.httpserverio.clientsockets")
+    /// 在用的 NWListener;state 切到 running 后非 nil
+    private var listener: NWListener?
 
-    public func port() throws -> Int {
-        return Int(try socket.port())
-    }
+    /// 当前活跃的 transport 集合,stop() 时统一关掉
+    private let connectionsLock = NSLock()
+    private var connections: [UUID: HttpTransport] = [:]
 
-    public func isIPv4() throws -> Bool {
-        return try socket.isIPv4()
-    }
+    /// listener 的 dispatch queue
+    private let listenerQueue = DispatchQueue(label: "swifter.httpserverio.listener", qos: .userInitiated)
+
+    /// listener 启动后报告的本地端口 —— start 完成时已经 ready,有值
+    private var resolvedPort: UInt16?
+
+    public init() {}
 
     deinit {
         stop()
     }
 
-    @available(macOS 10.10, *)
-    public func start(_ port: in_port_t = 8080, forceIPv4: Bool = false, priority: DispatchQoS.QoSClass = DispatchQoS.QoSClass.background) throws {
+    public func port() throws -> Int {
+        guard let resolvedPort = resolvedPort else {
+            throw HttpServerError.notRunning
+        }
+        return Int(resolvedPort)
+    }
+
+    public func isIPv4() throws -> Bool {
+        // NWListener 同时接受 v4/v6;此处保留 API 形态以兼容旧调用,统一返回 forceIPv4 时的语义
+        return forceIPv4Active
+    }
+
+    /// 内部 flag —— 记录上次 start 是否 forceIPv4
+    private var forceIPv4Active: Bool = false
+
+    /// 启动服务。
+    /// - Parameters:
+    ///   - port: 监听端口;0 表示交由系统分配
+    ///   - forceIPv4: true 时强制 IPv4 bind;false 时允许双栈
+    public func start(_ port: in_port_t = 8080, forceIPv4: Bool = false) async throws {
         guard !self.operating else { return }
         stop()
         self.state = .starting
-        let address = forceIPv4 ? listenAddressIPv4 : listenAddressIPv6
-        self.socket = try Socket.tcpSocketForListen(port, forceIPv4, SOMAXCONN, address)
-        self.state = .running
-        DispatchQueue.global(qos: priority).async { [weak self] in
-            guard let strongSelf = self else { return }
-            guard strongSelf.operating else { return }
-            while let socket = try? strongSelf.socket.acceptClientSocket() {
-                DispatchQueue.global(qos: priority).async { [weak self] in
-                    guard let strongSelf = self else { return }
-                    guard strongSelf.operating else { return }
-                    strongSelf.queue.async {
-                        strongSelf.sockets.insert(socket)
-                    }
+        self.forceIPv4Active = forceIPv4
 
-                    strongSelf.handleConnection(socket)
-
-                    strongSelf.queue.async {
-                        strongSelf.sockets.remove(socket)
-                    }
-                }
-            }
-            strongSelf.stop()
+        let params = HttpServerIO.makeParameters(forceIPv4: forceIPv4)
+        let endpointPort = NWEndpoint.Port(rawValue: port) ?? .any
+        let listener: NWListener
+        do {
+            listener = try NWListener(using: params, on: endpointPort)
+        } catch {
+            self.state = .stopped
+            throw HttpServerError.bindFailed(error.localizedDescription)
         }
+        self.listener = listener
+
+        listener.newConnectionHandler = { [weak self] conn in
+            self?.handleNewConnection(conn)
+        }
+
+        let ready = ListenerReadyAwaiter()
+        listener.stateUpdateHandler = { [weak self] state in
+            switch state {
+            case .ready:
+                let resolved = listener.port?.rawValue
+                self?.resolvedPort = resolved
+                ready.fulfill(.success(()))
+            case .failed(let error):
+                self?.state = .stopped
+                ready.fulfill(.failure(HttpServerError.bindFailed(error.localizedDescription)))
+            case .cancelled:
+                self?.state = .stopped
+            default:
+                break
+            }
+        }
+
+        listener.start(queue: listenerQueue)
+
+        do {
+            try await ready.wait()
+        } catch {
+            listener.cancel()
+            self.listener = nil
+            self.state = .stopped
+            throw error
+        }
+        self.state = .running
     }
 
+    /// 同步停机 —— 取消 listener、关闭所有连接、复位状态。
     public func stop() {
-        guard self.operating else { return }
+        guard self.operating || self.state == .starting else { return }
         self.state = .stopping
-        // Shutdown connected peers because they can live in 'keep-alive' or 'websocket' loops.
-        for socket in self.sockets {
-            socket.close()
+
+        // 关掉所有活跃 transport(keep-alive / websocket 循环会感知 disconnected 退出)
+        connectionsLock.lock()
+        let snapshot = Array(connections.values)
+        connections.removeAll(keepingCapacity: true)
+        connectionsLock.unlock()
+        for transport in snapshot {
+            transport.close()
         }
-        self.queue.sync {
-            self.sockets.removeAll(keepingCapacity: true)
-        }
-        socket.close()
+
+        listener?.cancel()
+        listener = nil
+        resolvedPort = nil
+
         self.state = .stopped
     }
 
-    open func dispatch(_ request: HttpRequest) -> ([String: String], (HttpRequest) -> HttpResponse) {
-        return ([:], { _ in HttpResponse.notFound(nil) })
+    /// 默认 dispatch:返回 404。子类 HttpServer 覆盖。
+    open func dispatch(_ request: HttpRequest) -> ([String: String], HttpHandler) {
+        return ([:], .sync { _ in HttpResponse.notFound(nil) })
     }
 
-    private func handleConnection(_ socket: Socket) {
+    // MARK: - Connection lifecycle
+
+    private func handleNewConnection(_ conn: NWConnection) {
+        let id = UUID()
+        let transport = NWTransport(conn)
+
+        connectionsLock.lock()
+        connections[id] = transport
+        connectionsLock.unlock()
+
+        conn.start(queue: listenerQueue)
+
+        Task.detached { [weak self] in
+            do {
+                try await self?.handleConnection(transport)
+            } catch {
+                // disconnected/EOF 是常态,无需打印
+            }
+            self?.connectionsLock.lock()
+            self?.connections.removeValue(forKey: id)
+            self?.connectionsLock.unlock()
+            transport.close()
+        }
+    }
+
+    private func handleConnection(_ transport: HttpTransport) async throws {
         let parser = HttpParser()
-        while self.operating, let request = try? parser.readHttpRequest(socket) {
-            let request = request
-            request.address = try? socket.peername()
+        while self.operating {
+            let request: HttpRequest
+            do {
+                request = try await parser.readHttpRequest(transport)
+            } catch {
+                // 客户端断开 / 报文异常,结束该连接
+                return
+            }
+            request.address = transport.peername
             let (params, handler) = self.dispatch(request)
             request.params = params
-            let response = handler(request)
+
+            let response: HttpResponse
+            do {
+                switch handler {
+                case .sync(let block):
+                    response = block(request)
+                case .async(let block):
+                    response = try await block(request)
+                }
+            } catch {
+                response = .internalServerError(.text("\(error)"))
+            }
+
             var keepConnection = parser.supportsKeepAlive(request.headers)
             do {
                 if self.operating {
-                    keepConnection = try self.respond(socket, response: response, keepAlive: keepConnection)
+                    keepConnection = try await respond(transport, response: response, keepAlive: keepConnection)
                 }
             } catch {
                 print("Failed to send response: \(error)")
             }
-            if let session = response.socketSession() {
-                delegate?.socketConnectionReceived(socket)
-                session(socket)
-                break
+
+            if let session = response.transportSession() {
+                delegate?.transportConnectionReceived(transport)
+                await session(transport)
+                return
             }
-            if !keepConnection { break }
+            if !keepConnection { return }
         }
-        socket.close()
     }
+
+    // MARK: - Response writing
 
     private struct InnerWriteContext: HttpResponseBodyWriter {
 
-        let socket: Socket
+        let transport: HttpTransport
+
+        // HttpResponseBodyWriter 协议是 sync;这里只在 respond 内部使用,
+        // respond 自己负责把这些 write 包成 async write 任务。
+        // 实现方式:用一个内部 collector buffer,respond 写完后整体 await 写入。
+        let collector: BufferCollector
 
         func write(_ file: String.File) throws {
-            try socket.writeFile(file)
+            // String.File 是 fread 包装,这里一段段读完后塞到 collector;
+            // respond 收尾时一次性 flush。
+            var chunk = [UInt8](repeating: 0, count: 64 * 1024)
+            while true {
+                let count = try file.read(&chunk)
+                if count <= 0 { break }
+                collector.append(Array(chunk[0..<count]))
+                if count < chunk.count { break }
+            }
+            file.close()
         }
 
         func write(_ data: [UInt8]) throws {
-            try write(ArraySlice(data))
+            collector.append(data)
         }
 
         func write(_ data: ArraySlice<UInt8>) throws {
-            try socket.writeUInt8(data)
+            collector.append(Array(data))
         }
 
         func write(_ data: NSData) throws {
-            try socket.writeData(data)
+            try write(Data(referencing: data))
         }
 
         func write(_ data: Data) throws {
-            try socket.writeData(data)
+            collector.append([UInt8](data))
         }
     }
 
-    private func respond(_ socket: Socket, response: HttpResponse, keepAlive: Bool) throws -> Bool {
+    /// 收集 sync HttpResponseBody.content writer 调用产生的字节,等 respond 一次性写。
+    final class BufferCollector {
+        private var buffer: [UInt8] = []
+        private let lock = NSLock()
+        func append(_ data: [UInt8]) {
+            lock.lock(); buffer.append(contentsOf: data); lock.unlock()
+        }
+        func drain() -> [UInt8] {
+            lock.lock(); let out = buffer; buffer.removeAll(keepingCapacity: false); lock.unlock()
+            return out
+        }
+    }
+
+    private func respond(_ transport: HttpTransport, response: HttpResponse, keepAlive: Bool) async throws -> Bool {
         guard self.operating else { return false }
 
-        // Some web-socket clients (like Jetfire) expects to have header section in a single packet.
-        // We can't promise that but make sure we invoke "write" only once for response header section.
-
         var responseHeader = String()
-
         responseHeader.append("HTTP/1.1 \(response.statusCode) \(response.reasonPhrase)\r\n")
 
         let content = response.content()
@@ -188,13 +306,81 @@ open class HttpServerIO {
 
         responseHeader.append("\r\n")
 
-        try socket.writeUTF8(responseHeader)
+        // Some web-socket clients (Jetfire) want the header in a single packet —
+        // 集中后用一次 write 发出
+        try await transport.write(responseHeader)
 
         if let writeClosure = content.write {
-            let context = InnerWriteContext(socket: socket)
+            let collector = BufferCollector()
+            let context = InnerWriteContext(transport: transport, collector: collector)
             try writeClosure(context)
+            let bytes = collector.drain()
+            if !bytes.isEmpty {
+                try await transport.write(ArraySlice(bytes))
+            }
         }
 
         return keepAlive && content.length != -1
+    }
+
+    // MARK: - NWParameters factory
+
+    private static func makeParameters(forceIPv4: Bool) -> NWParameters {
+        let params = NWParameters.tcp
+        params.allowLocalEndpointReuse = true
+        if forceIPv4 {
+            // 强制 IPv4:禁用 IPv6 协议栈
+            if let ipOption = params.defaultProtocolStack.internetProtocol as? NWProtocolIP.Options {
+                ipOption.version = .v4
+            }
+        }
+        return params
+    }
+}
+
+public enum HttpServerError: Error, Sendable {
+    case bindFailed(String)
+    case notRunning
+}
+
+// MARK: - Listener-ready async helper
+
+private final class ListenerReadyAwaiter: @unchecked Sendable {
+    private let lock = NSLock()
+    private var result: Result<Void, Error>?
+    private var waiter: CheckedContinuation<Void, Error>?
+
+    func fulfill(_ r: Result<Void, Error>) {
+        lock.lock()
+        if let waiter = waiter {
+            self.waiter = nil
+            lock.unlock()
+            switch r {
+            case .success: waiter.resume()
+            case .failure(let e): waiter.resume(throwing: e)
+            }
+        } else if result == nil {
+            result = r
+            lock.unlock()
+        } else {
+            lock.unlock()
+        }
+    }
+
+    func wait() async throws {
+        try await withCheckedThrowingContinuation { (cont: CheckedContinuation<Void, Error>) in
+            lock.lock()
+            if let result = result {
+                self.result = nil
+                lock.unlock()
+                switch result {
+                case .success: cont.resume()
+                case .failure(let e): cont.resume(throwing: e)
+                }
+            } else {
+                waiter = cont
+                lock.unlock()
+            }
+        }
     }
 }

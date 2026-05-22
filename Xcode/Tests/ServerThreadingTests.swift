@@ -19,81 +19,71 @@ class ServerThreadingTests: XCTestCase {
     }
 
     override func tearDown() {
-        if server.operating {
+        if let server = server, server.operating {
             server.stop()
         }
         server = nil
         super.tearDown()
     }
 
-    func testShouldHandleTheRequestInDifferentTimeIntervals() {
+    func testShouldHandleTheRequestInDifferentTimeIntervals() async {
 
         let path = "/a/:b/c"
         let queue = DispatchQueue(label: "com.swifter.threading")
-        let hostURL: URL
 
         server.GET[path] = { .ok(.htmlBody("You asked for " + $0.path)) }
 
-        do {
-            try server.start()
-            hostURL = defaultLocalhost
+        let requestExpectation = expectation(description: "Request should finish.")
+        requestExpectation.expectedFulfillmentCount = 3
 
-            let requestExpectation = expectation(description: "Request should finish.")
-            requestExpectation.expectedFulfillmentCount = 3
+        do {
+            try await server.start(8081)
+            let hostURL = URL(string: "http://localhost:8081")!
 
             (1...3).forEach { index in
-                queue.asyncAfter(deadline: .now() + .seconds(index)) {
+                queue.asyncAfter(deadline: .now() + .milliseconds(index * 200)) {
                     let task = URLSession.shared.executeAsyncTask(hostURL: hostURL, path: path) { (_, response, _ ) in
-                        requestExpectation.fulfill()
                         let statusCode = (response as? HTTPURLResponse)?.statusCode
                         XCTAssertNotNil(statusCode)
                         XCTAssertEqual(statusCode, 200, "\(hostURL)")
+                        requestExpectation.fulfill()
                     }
-
                     task.resume()
                 }
             }
-
         } catch let error {
             XCTFail("\(error)")
         }
 
-        waitForExpectations(timeout: 10, handler: nil)
+        await fulfillment(of: [requestExpectation], timeout: 10)
     }
 
-    func testShouldHandleTheSameRequestConcurrently() {
+    func testShouldHandleTheSameRequestConcurrently() async {
 
         let path = "/a/:b/c"
         server.GET[path] = { .ok(.htmlBody("You asked for " + $0.path)) }
 
-        var requestExpectation: XCTestExpectation? = expectation(description: "Should handle the request concurrently")
+        let requestExpectation = expectation(description: "Should handle the request concurrently")
+        requestExpectation.expectedFulfillmentCount = 3
 
         do {
-
-            try server.start()
-            let downloadGroup = DispatchGroup()
+            try await server.start(8082)
+            let hostURL = URL(string: "http://localhost:8082")!
 
             DispatchQueue.concurrentPerform(iterations: 3) { _ in
-                downloadGroup.enter()
-
-                let task = URLSession.shared.executeAsyncTask(path: path) { (_, response, _ ) in
-
+                let task = URLSession.shared.executeAsyncTask(hostURL: hostURL, path: path) { (_, response, _ ) in
                     let statusCode = (response as? HTTPURLResponse)?.statusCode
                     XCTAssertNotNil(statusCode)
                     XCTAssertEqual(statusCode, 200)
-                    requestExpectation?.fulfill()
-                    requestExpectation = nil
-                    downloadGroup.leave()
+                    requestExpectation.fulfill()
                 }
-
                 task.resume()
             }
-
         } catch let error {
             XCTFail("\(error)")
         }
 
-        waitForExpectations(timeout: 15, handler: nil)
+        await fulfillment(of: [requestExpectation], timeout: 15)
     }
 }
 
@@ -102,8 +92,8 @@ extension URLSession {
     func executeAsyncTask(
         hostURL: URL = defaultLocalhost,
         path: String,
-        completionHandler handler: @escaping (Data?, URLResponse?, Error?) -> Void
-        ) -> URLSessionDataTask {
+        completionHandler handler: @escaping @Sendable (Data?, URLResponse?, Error?) -> Void
+    ) -> URLSessionDataTask {
         return self.dataTask(with: hostURL.appendingPathComponent(path), completionHandler: handler)
     }
 }

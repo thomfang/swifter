@@ -33,7 +33,7 @@ public protocol HttpTransport: Sendable {
     /// 非 UTF-8 字节抛 invalidData
     func readLine() async throws -> String
 
-    /// 写入 byte slice
+    /// 写入 byte slice(async,失败抛错;用于 HTTP 响应路径,需要错误传播)
     func write(_ data: ArraySlice<UInt8>) async throws
 
     /// 写入 Data
@@ -41,6 +41,11 @@ public protocol HttpTransport: Sendable {
 
     /// 写入 UTF-8 字符串
     func write(_ utf8: String) async throws
+
+    /// 非阻塞同步入队写 —— 按调用顺序排队,不等送达,失败静默丢弃。
+    /// 用于 WebSocket frame 推送等"不需要错误传播 + 必须保持调用方 sync API"场景。
+    /// 实现需保证同一 transport 上多次 sendNonBlocking 按调用顺序投递到对端。
+    func sendNonBlocking(_ data: ArraySlice<UInt8>)
 
     /// 对端地址(诊断用,不可解析时返回 nil)
     var peername: String? { get }

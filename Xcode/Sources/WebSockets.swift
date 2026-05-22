@@ -8,19 +8,20 @@
 import Foundation
 
 @available(*, deprecated, message: "Use websocket(text:binary:pong:connected:disconnected:) instead.")
-public func websocket(_ text: @escaping (WebSocketSession, String) -> Void,
-                      _ binary: @escaping (WebSocketSession, [UInt8]) -> Void,
-                      _ pong: @escaping (WebSocketSession, [UInt8]) -> Void) -> ((HttpRequest) -> HttpResponse) {
+public func websocket(_ text: @escaping @Sendable (WebSocketSession, String) -> Void,
+                      _ binary: @escaping @Sendable (WebSocketSession, [UInt8]) -> Void,
+                      _ pong: @escaping @Sendable (WebSocketSession, [UInt8]) -> Void) -> (@Sendable (HttpRequest) -> HttpResponse) {
     return websocket(text: text, binary: binary, pong: pong)
 }
 
 // swiftlint:disable function_body_length
 public func websocket(
-    text: ((WebSocketSession, String) -> Void)? = nil,
-    binary: ((WebSocketSession, [UInt8]) -> Void)? = nil,
-    pong: ((WebSocketSession, [UInt8]) -> Void)? = nil,
-    connected: ((WebSocketSession) -> Void)? = nil,
-    disconnected: ((WebSocketSession) -> Void)? = nil) -> ((HttpRequest) -> HttpResponse) {
+    text: (@Sendable (WebSocketSession, String) -> Void)? = nil,
+    binary: (@Sendable (WebSocketSession, [UInt8]) -> Void)? = nil,
+    pong: (@Sendable (WebSocketSession, [UInt8]) -> Void)? = nil,
+    connected: (@Sendable (WebSocketSession) -> Void)? = nil,
+    disconnected: (@Sendable (WebSocketSession) -> Void)? = nil
+) -> (@Sendable (HttpRequest) -> HttpResponse) {
     return { request in
         guard request.hasTokenForHeader("upgrade", token: "websocket") else {
             return .badRequest(.text("Invalid value of 'Upgrade' header: \(request.headers["upgrade"] ?? "unknown")"))
@@ -31,96 +32,26 @@ public func websocket(
         guard let secWebSocketKey = request.headers["sec-websocket-key"] else {
             return .badRequest(.text("Invalid value of 'Sec-Websocket-Key' header: \(request.headers["sec-websocket-key"] ?? "unknown")"))
         }
-        let protocolSessionClosure: ((Socket) -> Void) = { socket in
-            let session = WebSocketSession(socket)
-            var fragmentedOpCode = WebSocketSession.OpCode.close
-            var payload = [UInt8]() // Used for fragmented frames.
-
-            func handleTextPayload(_ frame: WebSocketSession.Frame) throws {
-                if let handleText = text {
-                    if frame.fin {
-                        if payload.count > 0 {
-                            throw WebSocketSession.WsError.protocolError("Continuing fragmented frame cannot have an operation code.")
-                        }
-                        var textFramePayload = frame.payload.map { Int8(bitPattern: $0) }
-                        textFramePayload.append(0)
-                        if let text = String(validatingUTF8: textFramePayload) {
-                            handleText(session, text)
-                        } else {
-                            throw WebSocketSession.WsError.invalidUTF8("")
-                        }
-                    } else {
-                        payload.append(contentsOf: frame.payload)
-                        fragmentedOpCode = .text
-                    }
-                }
-            }
-
-            func handleBinaryPayload(_ frame: WebSocketSession.Frame) throws {
-                if let handleBinary = binary {
-                    if frame.fin {
-                        if payload.count > 0 {
-                            throw WebSocketSession.WsError.protocolError("Continuing fragmented frame cannot have an operation code.")
-                        }
-                        handleBinary(session, frame.payload)
-                    } else {
-                        payload.append(contentsOf: frame.payload)
-                        fragmentedOpCode = .binary
-                    }
-                }
-            }
-
-            func handleOperationCode(_ frame: WebSocketSession.Frame) throws {
-                switch frame.opcode {
-                case .continue:
-                    // There is no message to continue, failed immediatelly.
-                    if fragmentedOpCode == .close {
-                        socket.close()
-                    }
-                    frame.opcode = fragmentedOpCode
-                    if frame.fin {
-                        payload.append(contentsOf: frame.payload)
-                        frame.payload = payload
-                        // Clean the buffer.
-                        payload = []
-                        // Reset the OpCode.
-                        fragmentedOpCode = WebSocketSession.OpCode.close
-                    }
-                    try handleOperationCode(frame)
-                case .text:
-                    try handleTextPayload(frame)
-                case .binary:
-                    try handleBinaryPayload(frame)
-                case .close:
-                    throw WebSocketSession.Control.close
-                case .ping:
-                    if frame.payload.count > 125 {
-                        throw WebSocketSession.WsError.protocolError("Payload gretter than 125 octets.")
-                    } else {
-                        session.writeFrame(ArraySlice(frame.payload), .pong)
-                    }
-                case .pong:
-                    if let handlePong = pong {
-                       handlePong(session, frame.payload)
-                    }
-                }
-            }
-
-            func read() throws {
-                while true {
-                    let frame = try session.readFrame()
-                    try handleOperationCode(frame)
-                }
-            }
+        let protocolSessionClosure: @Sendable (HttpTransport) async -> Void = { transport in
+            let session = WebSocketSession(transport)
+            // 分片状态(payload / fragmentedOpCode)是连接内单线程消费 —— readLoop 串行处理
+            // 收到的每个 frame,因此用 class 包装规避 capture-by-var 在并发上下文中的告警
+            let state = FragmentState()
 
             connected?(session)
 
             do {
-                try read()
+                try await WSReadLoop.readLoop(
+                    session: session,
+                    transport: transport,
+                    state: state,
+                    text: text,
+                    binary: binary,
+                    pong: pong
+                )
             } catch let error {
                 switch error {
                 case WebSocketSession.Control.close:
-                    // Normal close
                     break
                 case WebSocketSession.WsError.unknownOpCode:
                     print("Unknown Op Code: \(error)")
@@ -133,7 +64,6 @@ public func websocket(
                 default:
                     print("Unkown error \(error)")
                 }
-                // If an error occurs, send the close handshake.
                 session.writeCloseFrame()
             }
 
@@ -145,13 +75,115 @@ public func websocket(
     }
 }
 
-public class WebSocketSession: Hashable, Equatable {
+/// 私有命名空间,把 readLoop 抽出来避免 @Sendable 闭包内捕获可变 var
+private enum WSReadLoop {}
+
+private final class FragmentState: @unchecked Sendable {
+    var opcode: WebSocketSession.OpCode = .close
+    var payload: [UInt8] = []
+}
+
+private extension WSReadLoop {
+    static func readLoop(
+        session: WebSocketSession,
+        transport: HttpTransport,
+        state: FragmentState,
+        text: (@Sendable (WebSocketSession, String) -> Void)?,
+        binary: (@Sendable (WebSocketSession, [UInt8]) -> Void)?,
+        pong: (@Sendable (WebSocketSession, [UInt8]) -> Void)?
+    ) async throws {
+        while true {
+            let frame = try await session.readFrame()
+            try handleOperationCode(
+                frame: frame,
+                session: session,
+                transport: transport,
+                state: state,
+                text: text,
+                binary: binary,
+                pong: pong
+            )
+        }
+    }
+
+    static func handleOperationCode(
+        frame: WebSocketSession.Frame,
+        session: WebSocketSession,
+        transport: HttpTransport,
+        state: FragmentState,
+        text: (@Sendable (WebSocketSession, String) -> Void)?,
+        binary: (@Sendable (WebSocketSession, [UInt8]) -> Void)?,
+        pong: (@Sendable (WebSocketSession, [UInt8]) -> Void)?
+    ) throws {
+        switch frame.opcode {
+        case .continue:
+            if state.opcode == .close {
+                transport.close()
+            }
+            frame.opcode = state.opcode
+            if frame.fin {
+                state.payload.append(contentsOf: frame.payload)
+                frame.payload = state.payload
+                state.payload = []
+                state.opcode = .close
+            }
+            try handleOperationCode(
+                frame: frame, session: session, transport: transport,
+                state: state, text: text, binary: binary, pong: pong
+            )
+        case .text:
+            if let handleText = text {
+                if frame.fin {
+                    if !state.payload.isEmpty {
+                        throw WebSocketSession.WsError.protocolError("Continuing fragmented frame cannot have an operation code.")
+                    }
+                    var textFramePayload = frame.payload.map { Int8(bitPattern: $0) }
+                    textFramePayload.append(0)
+                    if let text = String(validatingUTF8: textFramePayload) {
+                        handleText(session, text)
+                    } else {
+                        throw WebSocketSession.WsError.invalidUTF8("")
+                    }
+                } else {
+                    state.payload.append(contentsOf: frame.payload)
+                    state.opcode = .text
+                }
+            }
+        case .binary:
+            if let handleBinary = binary {
+                if frame.fin {
+                    if !state.payload.isEmpty {
+                        throw WebSocketSession.WsError.protocolError("Continuing fragmented frame cannot have an operation code.")
+                    }
+                    handleBinary(session, frame.payload)
+                } else {
+                    state.payload.append(contentsOf: frame.payload)
+                    state.opcode = .binary
+                }
+            }
+        case .close:
+            throw WebSocketSession.Control.close
+        case .ping:
+            if frame.payload.count > 125 {
+                throw WebSocketSession.WsError.protocolError("Payload gretter than 125 octets.")
+            } else {
+                session.writeFrame(ArraySlice(frame.payload), .pong)
+            }
+        case .pong:
+            if let handlePong = pong {
+                handlePong(session, frame.payload)
+            }
+        }
+    }
+}
+
+public final class WebSocketSession: @unchecked Sendable, Hashable, Equatable {
 
     public enum WsError: Error { case unknownOpCode(String), unMaskedFrame(String), protocolError(String), invalidUTF8(String) }
     public enum OpCode: UInt8 { case `continue` = 0x00, close = 0x08, ping = 0x09, pong = 0x0A, text = 0x01, binary = 0x02 }
     public enum Control: Error { case close }
 
-    public class Frame {
+    public final class Frame {
         public var opcode = OpCode.close
         public var fin = false
         public var rsv1: UInt8 = 0
@@ -160,15 +192,18 @@ public class WebSocketSession: Hashable, Equatable {
         public var payload = [UInt8]()
     }
 
-    public let socket: Socket
+    public let transport: HttpTransport
+    /// 保证 writeFrame 三段字节(opcode、长度、payload)原子 enqueue
+    private let writeLock = NSLock()
 
-    public init(_ socket: Socket) {
-        self.socket = socket
+    public init(_ transport: HttpTransport) {
+        self.transport = transport
     }
 
     deinit {
-        writeCloseFrame()
-        socket.close()
+        // deinit 不能 await;只 cancel underlying transport,close frame 由调用方
+        // 主动 close() 时发送
+        transport.close()
     }
 
     public func writeText(_ text: String) {
@@ -186,17 +221,21 @@ public class WebSocketSession: Hashable, Equatable {
     public func writeFrame(_ data: ArraySlice<UInt8>, _ op: OpCode, _ fin: Bool = true) {
         let finAndOpCode = UInt8(fin ? 0x80 : 0x00) | op.rawValue
         let maskAndLngth = encodeLengthAndMaskFlag(UInt64(data.count), false)
-        do {
-            try self.socket.writeUInt8([finAndOpCode])
-            try self.socket.writeUInt8(maskAndLngth)
-            try self.socket.writeUInt8(data)
-        } catch {
-            print(error)
-        }
+        writeLock.lock()
+        defer { writeLock.unlock() }
+        transport.sendNonBlocking(ArraySlice([finAndOpCode]))
+        transport.sendNonBlocking(ArraySlice(maskAndLngth))
+        transport.sendNonBlocking(data)
     }
 
     public func writeCloseFrame() {
         writeFrame(ArraySlice("".utf8), .close)
+    }
+
+    /// 主动关闭 —— 发 close frame 并 cancel underlying transport(幂等)。
+    public func close() {
+        writeCloseFrame()
+        transport.close()
     }
 
     private func encodeLengthAndMaskFlag(_ len: UInt64, _ masked: Bool) -> [UInt8] {
@@ -224,9 +263,9 @@ public class WebSocketSession: Hashable, Equatable {
     }
 
     // swiftlint:disable function_body_length
-    public func readFrame() throws -> Frame {
+    public func readFrame() async throws -> Frame {
         let frm = Frame()
-        let fst = try socket.read()
+        let fst = try await transport.read()
         frm.fin = fst & 0x80 != 0
         frm.rsv1 = fst & 0x40
         frm.rsv2 = fst & 0x20
@@ -237,48 +276,45 @@ public class WebSocketSession: Hashable, Equatable {
         }
         let opc = fst & 0x0F
         guard let opcode = OpCode(rawValue: opc) else {
-            // "If an unknown opcode is received, the receiving endpoint MUST _Fail the WebSocket Connection_."
-            // http://tools.ietf.org/html/rfc6455#section-5.2 ( Page 29 )
             throw WsError.unknownOpCode("\(opc)")
         }
         if frm.fin == false {
             switch opcode {
             case .ping, .pong, .close:
-                // Control frames must not be fragmented
-                // https://tools.ietf.org/html/rfc6455#section-5.5 ( Page 35 )
                 throw WsError.protocolError("Control frames must not be fragmented.")
             default:
                 break
             }
         }
         frm.opcode = opcode
-        let sec = try socket.read()
+        let sec = try await transport.read()
         let msk = sec & 0x80 != 0
         guard msk else {
-            // "...a client MUST mask all frames that it sends to the server."
-            // http://tools.ietf.org/html/rfc6455#section-5.1
             throw WsError.unMaskedFrame("A client must mask all frames that it sends to the server.")
         }
         var len = UInt64(sec & 0x7F)
         if len == 0x7E {
-            let b0 = UInt64(try socket.read()) << 8
-            let b1 = UInt64(try socket.read())
+            let b0 = UInt64(try await transport.read()) << 8
+            let b1 = UInt64(try await transport.read())
             len = UInt64(littleEndian: b0 | b1)
         } else if len == 0x7F {
-            let b0 = UInt64(try socket.read()) << 54
-            let b1 = UInt64(try socket.read()) << 48
-            let b2 = UInt64(try socket.read()) << 40
-            let b3 = UInt64(try socket.read()) << 32
-            let b4 = UInt64(try socket.read()) << 24
-            let b5 = UInt64(try socket.read()) << 16
-            let b6 = UInt64(try socket.read()) << 8
-            let b7 = UInt64(try socket.read())
+            let b0 = UInt64(try await transport.read()) << 54
+            let b1 = UInt64(try await transport.read()) << 48
+            let b2 = UInt64(try await transport.read()) << 40
+            let b3 = UInt64(try await transport.read()) << 32
+            let b4 = UInt64(try await transport.read()) << 24
+            let b5 = UInt64(try await transport.read()) << 16
+            let b6 = UInt64(try await transport.read()) << 8
+            let b7 = UInt64(try await transport.read())
             len = UInt64(littleEndian: b0 | b1 | b2 | b3 | b4 | b5 | b6 | b7)
         }
 
-        let mask = [try socket.read(), try socket.read(), try socket.read(), try socket.read()]
-        // Read payload all at once, then apply mask (calling `socket.read` byte-by-byte is super slow).
-        frm.payload = try socket.read(length: Int(len))
+        let m0 = try await transport.read()
+        let m1 = try await transport.read()
+        let m2 = try await transport.read()
+        let m3 = try await transport.read()
+        let mask = [m0, m1, m2, m3]
+        frm.payload = try await transport.read(length: Int(len))
         for index in 0..<len {
             frm.payload[Int(index)] ^= mask[Int(index % 4)]
         }
@@ -286,10 +322,10 @@ public class WebSocketSession: Hashable, Equatable {
     }
 
     public func hash(into hasher: inout Hasher) {
-        hasher.combine(socket)
+        hasher.combine(ObjectIdentifier(self))
     }
 }
 
-public func == (webSocketSession1: WebSocketSession, webSocketSession2: WebSocketSession) -> Bool {
-    return webSocketSession1.socket == webSocketSession2.socket
+public func == (lhs: WebSocketSession, rhs: WebSocketSession) -> Bool {
+    return ObjectIdentifier(lhs) == ObjectIdentifier(rhs)
 }

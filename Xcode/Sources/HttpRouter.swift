@@ -7,6 +7,13 @@
 
 import Foundation
 
+/// 路由命中的处理器:sync 旧式 closure 或 async throws 新接口。
+/// HttpServerIO 在 dispatch 之后用 enum 区分执行路径。
+public enum HttpHandler: Sendable {
+    case sync(@Sendable (HttpRequest) -> HttpResponse)
+    case async(@Sendable (HttpRequest) async throws -> HttpResponse)
+}
+
 open class HttpRouter {
 
     public init() {}
@@ -20,7 +27,7 @@ open class HttpRouter {
         var isEndOfRoute: Bool = false
 
         /// The closure to handle the route
-        var handler: ((HttpRequest) -> HttpResponse)?
+        var handler: HttpHandler?
     }
 
     private var rootNode = Node()
@@ -47,7 +54,19 @@ open class HttpRouter {
         return result
     }
 
-    public func register(_ method: String?, path: String, handler: ((HttpRequest) -> HttpResponse)?) {
+    /// 注册 sync handler(向后兼容上游/旧调用方)
+    public func register(_ method: String?, path: String, handler: (@Sendable (HttpRequest) -> HttpResponse)?) {
+        let wrapped: HttpHandler? = handler.map { .sync($0) }
+        registerHandler(method, path: path, handler: wrapped)
+    }
+
+    /// 注册 async handler
+    public func register(_ method: String?, path: String, asyncHandler: (@Sendable (HttpRequest) async throws -> HttpResponse)?) {
+        let wrapped: HttpHandler? = asyncHandler.map { .async($0) }
+        registerHandler(method, path: path, handler: wrapped)
+    }
+
+    private func registerHandler(_ method: String?, path: String, handler: HttpHandler?) {
         var pathSegments = stripQuery(path).split("/")
         if let method = method {
             pathSegments.insert(method, at: 0)
@@ -58,7 +77,7 @@ open class HttpRouter {
         inflate(&rootNode, generator: &pathSegmentsGenerator).handler = handler
     }
 
-    public func route(_ method: String?, path: String) -> ([String: String], (HttpRequest) -> HttpResponse)? {
+    public func route(_ method: String?, path: String) -> ([String: String], HttpHandler)? {
 
         return queue.sync {
             if let method = method {
@@ -98,7 +117,7 @@ open class HttpRouter {
         return currentNode
     }
 
-    private func findHandler(_ node: inout Node, params: inout [String: String], generator: inout IndexingIterator<[String]>) -> ((HttpRequest) -> HttpResponse)? {
+    private func findHandler(_ node: inout Node, params: inout [String: String], generator: inout IndexingIterator<[String]>) -> HttpHandler? {
 
         var matchedRoutes = [Node]()
         let pattern = generator.map { $0 }

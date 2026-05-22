@@ -66,6 +66,16 @@ actor MockHttpTransport: HttpTransport {
         sink.append(contentsOf: data)
     }
 
+    /// 测试 mock:把字节投递到 actor 任务队列,actor 串行执行保证顺序。
+    nonisolated func sendNonBlocking(_ data: ArraySlice<UInt8>) {
+        let bytes = Array(data)
+        Task { await self.appendToSink(bytes) }
+    }
+
+    private func appendToSink(_ bytes: [UInt8]) {
+        sink.append(contentsOf: bytes)
+    }
+
     nonisolated func close() {
         Task { await self.markClosed() }
     }

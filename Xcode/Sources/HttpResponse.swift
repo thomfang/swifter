@@ -79,7 +79,7 @@ public enum HttpResponseBody {
 // swiftlint:disable cyclomatic_complexity
 public enum HttpResponse {
 
-    case switchProtocols([String: String], (Socket) -> Void)
+    case switchProtocols([String: String], @Sendable (HttpTransport) async -> Void)
     case ok(HttpResponseBody, [String: String] = [:]), created, accepted
     case movedPermanently(String)
     case movedTemporarily(String)
@@ -166,7 +166,7 @@ public enum HttpResponse {
         }
     }
 
-    func socketSession() -> ((Socket) -> Void)? {
+    func transportSession() -> (@Sendable (HttpTransport) async -> Void)? {
         switch self {
         case .switchProtocols(_, let handler) : return handler
         default: return nil
