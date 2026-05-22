@@ -39,7 +39,10 @@ let package = Package(
       dependencies: [
         "Swifter"
       ],
-      path: "Xcode/Tests"
+      path: "Xcode/Tests",
+      resources: [
+        .copy("Fixtures")
+      ]
     )
   ]
 )
