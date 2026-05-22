@@ -9,10 +9,15 @@ import Foundation
 
 public func shareFile(_ path: String) -> ((HttpRequest) -> HttpResponse) {
     return { _ in
+        // fopen 在目录上不会失败 —— 它返回非 nil 但 fread 拿到空数据,会让客户端
+        // 看到 200 + 空 body。在打开前显式排除目录,改返回 404
+        if (try? path.directory()) == true {
+            return .notFound()
+        }
         if let file = try? path.openForReading() {
             let mimeType = path.mimeType()
             var responseHeader: [String: String] = ["Content-Type": mimeType]
-            
+
             if let attr = try? FileManager.default.attributesOfItem(atPath: path),
                 let fileSize = attr[FileAttributeKey.size] as? UInt64 {
                 responseHeader["Content-Length"] = String(fileSize)
@@ -33,15 +38,30 @@ public func shareFilesFromDirectory(_ directoryPath: String, defaults: [String] 
         }
         if fileRelativePath.value.isEmpty {
             for path in defaults {
-                if let file = try? (directoryPath + String.pathSeparator + path).openForReading() {
-                    return .raw(200, "OK", [:], { writer in
+                let candidate = directoryPath + String.pathSeparator + path
+                if (try? candidate.directory()) == true { continue }
+                if let file = try? candidate.openForReading() {
+                    let mimeType = candidate.mimeType()
+                    var responseHeader: [String: String] = ["Content-Type": mimeType]
+                    if let attr = try? FileManager.default.attributesOfItem(atPath: candidate),
+                       let fileSize = attr[FileAttributeKey.size] as? UInt64 {
+                        responseHeader["Content-Length"] = String(fileSize)
+                    }
+                    return .raw(200, "OK", responseHeader, { writer in
                         try? writer.write(file)
                         file.close()
                     })
                 }
             }
+            return .notFound()
         }
         let filePath = directoryPath + String.pathSeparator + fileRelativePath.value
+
+        // 命中目录时 fopen 不会失败但 fread 拿不到内容;显式 404 比 200 + 空 body
+        // 对调用方更友好
+        if (try? filePath.directory()) == true {
+            return .notFound()
+        }
 
         if let file = try? filePath.openForReading() {
             let mimeType = fileRelativePath.value.mimeType()

@@ -94,4 +94,30 @@ class FilesTests: XCTestCase {
 
         XCTAssert(result.statusCode == 404)
     }
+
+    /// fopen 在目录上不会失败 —— 没有这道防御,shareFile 给目录返回 200 + 空 body。
+    /// 修复后,目录路径应该被 shareFile 当 404 处理。
+    func testShareFileRejectsDirectory() {
+        let request = HttpRequest()
+        let closure = shareFile(temporaryDirectoryURL.path)
+        let result = closure(request)
+
+        XCTAssertEqual(result.statusCode, 404)
+    }
+
+    /// 同样的防御对 shareFilesFromDirectory:path param 命中目录时应返回 404,
+    /// 不能把目录当文件 stream 出去
+    func testShareFilesFromDirectoryRejectsDirectoryHit() {
+        // 在 tmp 下创建一个子目录,确保命中
+        let subdirURL = temporaryDirectoryURL.appendingPathComponent(UUID().uuidString)
+        try? FileManager.default.createDirectory(at: subdirURL, withIntermediateDirectories: true)
+        defer { try? FileManager.default.removeItem(at: subdirURL) }
+
+        let request = HttpRequest()
+        request.params = ["path": subdirURL.lastPathComponent]
+        let closure = shareFilesFromDirectory(temporaryDirectoryURL.path)
+        let result = closure(request)
+
+        XCTAssertEqual(result.statusCode, 404)
+    }
 }
