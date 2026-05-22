@@ -84,13 +84,14 @@ open class HttpServerIO: @unchecked Sendable {
     /// - Parameters:
     ///   - port: 监听端口;0 表示交由系统分配
     ///   - forceIPv4: true 时强制 IPv4 bind;false 时允许双栈
-    public func start(_ port: in_port_t = 8080, forceIPv4: Bool = false) async throws {
+    ///   - tls: 非 nil 时启用 HTTPS;由 TLSConfig 提供 server identity
+    public func start(_ port: in_port_t = 8080, forceIPv4: Bool = false, tls: TLSConfig? = nil) async throws {
         guard !self.operating else { return }
         stop()
         self.state = .starting
         self.forceIPv4Active = forceIPv4
 
-        let params = HttpServerIO.makeParameters(forceIPv4: forceIPv4)
+        let params = HttpServerIO.makeParameters(forceIPv4: forceIPv4, tls: tls)
         let endpointPort = NWEndpoint.Port(rawValue: port) ?? .any
         let listener: NWListener
         do {
@@ -325,8 +326,13 @@ open class HttpServerIO: @unchecked Sendable {
 
     // MARK: - NWParameters factory
 
-    private static func makeParameters(forceIPv4: Bool) -> NWParameters {
-        let params = NWParameters.tcp
+    private static func makeParameters(forceIPv4: Bool, tls: TLSConfig?) -> NWParameters {
+        let params: NWParameters
+        if let tls = tls {
+            params = NWParameters(tls: tls.tlsOptions, tcp: .init())
+        } else {
+            params = NWParameters.tcp
+        }
         params.allowLocalEndpointReuse = true
         if forceIPv4 {
             // 强制 IPv4:禁用 IPv6 协议栈
