@@ -53,6 +53,10 @@ public func websocket(
                 switch error {
                 case WebSocketSession.Control.close:
                     break
+                case HttpTransportError.disconnected:
+                    // 客户端正常断开 —— 读 EOF 在 NWConnection 上表现为 disconnected,
+                    // 跟主动 close 等价,不需要打印
+                    break
                 case WebSocketSession.WsError.unknownOpCode:
                     print("Unknown Op Code: \(error)")
                 case WebSocketSession.WsError.unMaskedFrame:
