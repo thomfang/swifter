@@ -7,9 +7,6 @@
 //
 
 import XCTest
-#if os(Linux)
-import FoundationNetworking
-#endif
 @testable import Swifter
 
 class IOSafetyTests: XCTestCase {

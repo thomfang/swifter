@@ -7,9 +7,6 @@
 //
 
 import XCTest
-#if os(Linux)
-import FoundationNetworking
-#endif
 @testable import Swifter
 
 class ServerThreadingTests: XCTestCase {
@@ -38,14 +35,8 @@ class ServerThreadingTests: XCTestCase {
         server.GET[path] = { .ok(.htmlBody("You asked for " + $0.path)) }
 
         do {
-
-            #if os(Linux)
-            try server.start(9081)
-            hostURL = URL(string: "http://localhost:9081")!
-            #else
             try server.start()
             hostURL = defaultLocalhost
-            #endif
 
             let requestExpectation = expectation(description: "Request should finish.")
             requestExpectation.expectedFulfillmentCount = 3

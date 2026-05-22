@@ -33,11 +33,7 @@ open class HttpServerIO {
             return HttpServerIOState(rawValue: stateValue)!
         }
         set(state) {
-            #if !os(Linux)
             OSAtomicCompareAndSwapInt(self.state.rawValue, state.rawValue, &stateValue)
-            #else
-            self.stateValue = state.rawValue
-            #endif
         }
     }
 

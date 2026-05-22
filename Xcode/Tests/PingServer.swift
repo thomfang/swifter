@@ -7,9 +7,6 @@
 //
 
 import Foundation
-#if os(Linux)
-import FoundationNetworking
-#endif
 @testable import Swifter
 
 // Server

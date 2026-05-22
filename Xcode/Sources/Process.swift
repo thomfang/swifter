@@ -14,13 +14,9 @@ public class Process {
     }
 
     public static var tid: UInt64 {
-        #if os(Linux)
-            return UInt64(pthread_self())
-        #else
-            var tid: __uint64_t = 0
-            pthread_threadid_np(nil, &tid)
-            return UInt64(tid)
-        #endif
+        var tid: __uint64_t = 0
+        pthread_threadid_np(nil, &tid)
+        return UInt64(tid)
     }
 
     private static var signalsWatchers = [(Int32) -> Void]()
