@@ -1,99 +1,151 @@
-![Platform](https://img.shields.io/badge/Platform-Linux%20&%20OSX%20&%20tvOS-4BC51D.svg?style=flat)
-![Swift](https://img.shields.io/badge/Swift-4.x,_5.0-4BC51D.svg?style=flat)
-![Protocols](https://img.shields.io/badge/Protocols-HTTP%201.1%20&%20WebSockets-4BC51D.svg?style=flat)
-[![CocoaPods](https://img.shields.io/cocoapods/v/Swifter.svg?style=flat)](https://cocoapods.org/pods/Swifter)
-[![Carthage Compatible](https://img.shields.io/badge/Carthage-compatible-4BC51D.svg?style=flat)](https://github.com/Carthage/Carthage)
+![Platform](https://img.shields.io/badge/Platform-macOS%20%7C%20iOS%20%7C%20tvOS%20%7C%20watchOS-4BC51D.svg?style=flat)
+![Swift](https://img.shields.io/badge/Swift-5.9%2B-4BC51D.svg?style=flat)
+![Protocols](https://img.shields.io/badge/Protocols-HTTP%201.1%20%7C%20HTTPS%20%7C%20WebSockets-4BC51D.svg?style=flat)
+
+> **Fork notice.** This is a self-maintained fork of [httpswift/swifter](https://github.com/httpswift/swifter)
+> that drops the BSD-socket I/O layer and rebuilds it on Apple's
+> [Network.framework](https://developer.apple.com/documentation/network)
+> (`NWListener` / `NWConnection`). The headline additions are **async
+> handlers** and **HTTPS via TLSConfig**. The upstream `HttpRequest` /
+> `HttpResponse` / routing / WebSocket frame parsing are preserved so
+> existing handlers compile unchanged.
+>
+> Upstream sync (re-base or PR back) is **not** a goal; Linux is
+> unsupported.
 
 ### What is Swifter?
 
-Tiny http server engine written in [Swift](https://developer.apple.com/swift/) programming language.
+Tiny HTTP server engine written in Swift, embeddable in apps and
+extensions. Originally by [Damian Kołakowski](https://github.com/glock45)
+and the swifter contributors.
 
-### Branches
-`* stable` - lands on CocoaPods and others. Supports the latest non-beta Xcode and SPM. Stable.
+### Requirements
 
-`* master` - stable branch plus experimental web-framework layer.
+- Swift 5.9+
+- macOS 12+, iOS 15+, tvOS 15+, watchOS 8+
+- No external dependencies — `Network.framework` and `Security` are
+  system frameworks.
 
-`* 2.0   ` - next version of Swifter (async IO). Experimental.
+### Quick start
 
-
-### How to start?
 ```swift
-let server = HttpServer()
-server["/hello"] = { .ok(.htmlBody("You asked for \($0)"))  }
-server.start()
-```
+import Swifter
 
-### How to load HTML by string?
-```swift
 let server = HttpServer()
-server[path] = { request in
-    return HttpResponse.ok(.text("<html string>"))
+server["/hello"] = { req in
+    .ok(.htmlBody("You asked for \(req.path)"))
 }
-server.start()
+
+// start() is async now
+try await server.start(8080)
+print("Listening on port \(try server.port())")
 ```
 
-### How to share files?
+### Async handlers
+
 ```swift
 let server = HttpServer()
-server["/desktop/:path"] = shareFilesFromDirectory("/Users/me/Desktop")
-server.start()
-```
-### How to redirect?
-```swift
-let server = HttpServer()
-server["/redirect"] = { request in
-  return .movedPermanently("http://www.google.com")
+
+// sync handler — unchanged API
+server.GET["/sync"] = { _ in .ok(.text("hi")) }
+
+// async handler
+server.GET.setAsync("/slow") { _ in
+    try await Task.sleep(nanoseconds: 100_000_000)
+    return .ok(.text("done"))
 }
-server.start()
+
+try await server.start(8080)
 ```
-### How to HTML ?
+
+Async handlers run concurrently per-request; five 100ms handlers complete
+in ~110ms, not 500ms (see `HttpServerIOEndToEndTests.testAsyncHandlersRunConcurrently`).
+
+### HTTPS
+
 ```swift
-let server = HttpServer()
-server["/my_html"] = scopes { 
-  html {
-    body {
-      h1 { inner = "hello" }
-    }
-  }
-}
-server.start()
-```
-### How to WebSockets ?
-```swift
-let server = HttpServer()
-server["/websocket-echo"] = websocket(text: { session, text in
-  session.writeText(text)
-}, binary: { session, binary in
-  session.writeBinary(binary)
-})
-server.start()
-```
-### CocoaPods? Yes.
-```ruby
-use_frameworks!
+import Swifter
 
-pod 'Swifter', '~> 1.5.0'
-```
-
-### Carthage? Also yes.
-```
-github "httpswift/swifter" ~> 1.5.0
-```
-
-### Swift Package Manager.
-```swift
-import PackageDescription
-
-let package = Package(
-    name: "MyServer",
-    dependencies: [
-        .package(url: "https://github.com/httpswift/swifter.git", .upToNextMajor(from: "1.5.0"))
-    ]
+let tls = try TLSConfig.p12(
+    path: "/path/to/server.p12",
+    password: "your-p12-password"
 )
+
+let server = HttpServer()
+server.GET["/ping"] = { _ in .ok(.text("pong over tls")) }
+
+try await server.start(8443, tls: tls)
 ```
 
-### Docker.
-```
-docker run -d -p 9080:9080 -v `pwd`:/Swifter -w /Swifter --name Swifter swift bash -c "swift run"
+The P12 must contain a server identity (certificate + matching private
+key). Minimum TLS version is pinned at 1.2 inside `TLSConfig.p12`.
+
+Generating a self-signed P12 for development:
+
+```sh
+openssl req -x509 -newkey rsa:2048 \
+    -keyout localhost.key -out localhost.crt \
+    -days 3650 -nodes -subj "/CN=localhost" \
+    -addext "subjectAltName=DNS:localhost,IP:127.0.0.1"
+
+openssl pkcs12 -export -out localhost.p12 \
+    -inkey localhost.key -in localhost.crt \
+    -name "swifter-test" -password pass:swiftertest \
+    -keypbe PBE-SHA1-3DES -certpbe PBE-SHA1-3DES
 ```
 
+### WebSockets
+
+```swift
+let server = HttpServer()
+
+server["/echo"] = websocket(
+    text:    { session, text in session.writeText(text) },
+    binary:  { session, data in session.writeBinary(data) },
+    connected:    { _ in print("connected") },
+    disconnected: { _ in print("disconnected") }
+)
+
+try await server.start(8080)
+```
+
+WebSocketSession's `writeText` / `writeBinary` / `writeCloseFrame` are
+**sync** on purpose — JS-bridge callers see the same API. Internally they
+enqueue onto the transport's `sendNonBlocking` path. `session.close()`
+sends a close frame and cancels the transport.
+
+### How this fork differs from upstream
+
+| Area                       | Upstream                              | This fork                                                        |
+|----------------------------|---------------------------------------|------------------------------------------------------------------|
+| Socket layer               | BSD `socket(2)` + `accept` loop       | `NWListener` + `NWConnection`                                    |
+| `start()`                  | sync `try server.start(8080)`         | `try await server.start(8080, forceIPv4: false, tls: nil)`       |
+| Handlers                   | `(HttpRequest) -> HttpResponse`       | sync or `(HttpRequest) async throws -> HttpResponse`             |
+| `HttpResponse.switchProtocols` | `(Socket) -> Void`                | `@Sendable (HttpTransport) async -> Void`                        |
+| `WebSocketSession.socket`  | `Socket`                              | `transport: HttpTransport`; added `WebSocketSession.close()`     |
+| HTTPS                      | not supported                         | `TLSConfig.p12(path:password:)` → `start(_:tls:)`                |
+| Linux                      | supported                             | **not** supported — Darwin-only                                  |
+| iOS background suspend     | RUNNINGBOARD 0xdead10cc on socket hold | NWListener participates in system lifecycle                      |
+
+### Migration notes for users of `master`
+
+- Wrap `server.start(...)` in `await` and the enclosing function in
+  `async throws`.
+- If you used `HttpServerIODelegate.socketConnectionReceived(_:)`, rename
+  to `transportConnectionReceived(_:)` and change the argument type to
+  `HttpTransport`.
+- `HttpResponse.switchProtocols` closure now takes `HttpTransport` and
+  must be `@Sendable () async -> Void`. The built-in `websocket(...)`
+  factory already does this; only matters if you call `switchProtocols`
+  directly.
+
+### Roadmap
+
+- Keychain identity loader as an alternative to P12 files
+- Optional client-certificate verification (mTLS)
+- Evaluate HTTP/2 over `NWProtocolQUIC` if a use case shows up
+
+### License
+
+MIT, inherited from upstream. Original copyright Damian Kołakowski; fork
+modifications retain the same license.
