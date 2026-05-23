@@ -86,7 +86,10 @@ open class HttpServerIO: @unchecked Sendable {
     public func start(_ port: in_port_t = 8080, forceIPv4: Bool = false, tls: TLSConfig? = nil) throws {
         let semaphore = DispatchSemaphore(value: 0)
         let box = ErrorBox()
-        Task.detached { [box, self] in
+        // sync 调用方可能在 main thread (UserInteractive QoS) 等 semaphore;
+        // Task.detached 默认走 .medium,会触发 priority inversion 告警。
+        // 把 Task 提升到 .userInitiated,与 sync caller 的优先级匹配。
+        Task.detached(priority: .userInitiated) { [box, self] in
             do {
                 try await self.startAsync(port, forceIPv4: forceIPv4, tls: tls)
             } catch {
