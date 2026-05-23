@@ -192,6 +192,20 @@ open class HttpRouter {
             matchedNodes.append(node)
             return
         }
+
+        // Trailing-slash 兼容:pattern 已耗尽,但当前 node 有一个 endOfRoute 的
+        // variable 子节点(例如注册路径 "/static/:path",请求 "/static/")。
+        // String.split(omittingEmptySubsequences:true) 会把 trailing slash 丢掉,
+        // 所以 pattern 段数比注册时少一段;这里把 variable 段用空字符串补上,
+        // 让 shareFilesFromDirectory / directoryBrowser 这种"根路径走默认文件 /
+        // 列目录"的 handler 能命中。
+        if index == count {
+            for (key, child) in node.nodes where key.first == ":" && child.isEndOfRoute {
+                params[key] = ""
+                matchedNodes.append(child)
+                return
+            }
+        }
     }
 
     private func stripQuery(_ path: String) -> String {

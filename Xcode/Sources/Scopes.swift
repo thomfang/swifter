@@ -12,8 +12,14 @@ public func scopes(_ scope: @escaping Closure) -> ((HttpRequest) -> HttpResponse
     return { _ in
         scopesBuffer[Process.tid] = ""
         scope()
-        return .raw(200, "OK", ["Content-Type": "text/html"], {
-            try? $0.write([UInt8](("<!DOCTYPE html>"  + (scopesBuffer[Process.tid] ?? "")).utf8))
+        // scope() 在 handler 当前线程把内容写进 scopesBuffer[Process.tid]。
+        // respond 的 writer closure 可能在 async Task hop 后的另一个线程上跑,
+        // Process.tid 已经不同 → 旧实现会读到 nil 并输出只有 "<!DOCTYPE html>" 的空页。
+        // 这里在 scope() 结束后立即把内容 capture 到 closure,与执行线程解耦
+        let snapshot = scopesBuffer[Process.tid] ?? ""
+        scopesBuffer[Process.tid] = nil
+        return .raw(200, "OK", ["Content-Type": "text/html"], { writer in
+            try? writer.write([UInt8](("<!DOCTYPE html>" + snapshot).utf8))
         })
     }
 }
