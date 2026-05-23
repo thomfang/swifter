@@ -5,13 +5,13 @@
 > **Fork notice.** This is a self-maintained fork of [httpswift/swifter](https://github.com/httpswift/swifter)
 > that drops the BSD-socket I/O layer and rebuilds it on Apple's
 > [Network.framework](https://developer.apple.com/documentation/network)
-> (`NWListener` / `NWConnection`). The headline additions are **async
-> handlers** and **HTTPS via TLSConfig**. The upstream `HttpRequest` /
-> `HttpResponse` / routing / WebSocket frame parsing are preserved so
-> existing handlers compile unchanged.
+> (`NWListener` / `NWConnection`). Headline additions: **async handlers**,
+> **async middleware**, **custom 404**, and **HTTPS via TLSConfig** (file
+> path or in-memory bytes, with optional TLS version pinning). The upstream
+> `HttpRequest` / `HttpResponse` / routing / WebSocket frame parsing are
+> preserved so existing handlers compile unchanged.
 >
-> Upstream sync (re-base or PR back) is **not** a goal; Linux is
-> unsupported.
+> Upstream sync (re-base or PR back) is **not** a goal; Linux is unsupported.
 
 ### What is Swifter?
 
@@ -61,24 +61,75 @@ try await server.start(8080)
 Async handlers run concurrently per-request; five 100ms handlers complete
 in ~110ms, not 500ms (see `HttpServerIOEndToEndTests.testAsyncHandlersRunConcurrently`).
 
+### Async middleware
+
+Each layer registered with `server.use { ... }` runs before route
+dispatch, in registration order. Return `nil` to pass through, or an
+`HttpResponse` to short-circuit. Throwing becomes a 500.
+
+```swift
+let server = HttpServer()
+
+server.use { req in
+    if req.headers["x-auth"] == nil {
+        return .unauthorized(.text("missing x-auth"))
+    }
+    return nil   // pass through
+}
+
+server.GET["/secret"] = { _ in .ok(.text("you got it")) }
+
+try await server.start(8080)
+```
+
+The legacy sync `server.middleware = [...]` array from upstream is still
+honored and runs before the async chain.
+
+### Custom 404
+
+```swift
+server.notFoundAsyncHandler = { req in
+    .notFound(.text("no route: \(req.path)"))
+}
+
+// sync variant is still there for legacy callers
+server.notFoundHandler = { _ in .notFound(.text("nope")) }
+```
+
+When both are set, the async handler wins.
+
 ### HTTPS
+
+`TLSConfig` accepts a PKCS#12 identity from a **file path** or from
+**raw bytes** (the bytes path is convenient when the P12 lives in
+Keychain or another in-memory source). Minimum/maximum TLS version
+default to "≥1.2 with no upper bound" but can be pinned.
 
 ```swift
 import Swifter
 
+// from a file
 let tls = try TLSConfig.p12(
     path: "/path/to/server.p12",
     password: "your-p12-password"
 )
 
+// from bytes, locked to TLS 1.3 only
+let bytes: Data = loadFromKeychain()
+let strictTLS = try TLSConfig.p12(
+    data: bytes,
+    password: "your-p12-password",
+    minVersion: .v1_3,
+    maxVersion: .v1_3
+)
+
 let server = HttpServer()
 server.GET["/ping"] = { _ in .ok(.text("pong over tls")) }
-
 try await server.start(8443, tls: tls)
 ```
 
-The P12 must contain a server identity (certificate + matching private
-key). Minimum TLS version is pinned at 1.2 inside `TLSConfig.p12`.
+Only TLSv1.2 and TLSv1.3 are exposed — Apple deprecated TLSv1.0/1.1 in
+macOS 12 / iOS 15.
 
 Generating a self-signed P12 for development:
 
@@ -121,9 +172,11 @@ sends a close frame and cancels the transport.
 | Socket layer               | BSD `socket(2)` + `accept` loop       | `NWListener` + `NWConnection`                                    |
 | `start()`                  | sync `try server.start(8080)`         | `try await server.start(8080, forceIPv4: false, tls: nil)`       |
 | Handlers                   | `(HttpRequest) -> HttpResponse`       | sync or `(HttpRequest) async throws -> HttpResponse`             |
+| Middleware                 | sync only (`[Request -> Response?]`)  | sync chain + async chain via `server.use { ... }`                |
+| Custom 404                 | `notFoundHandler` (sync)              | `notFoundHandler` (sync) + `notFoundAsyncHandler` (async)        |
+| HTTPS                      | not supported                         | `TLSConfig.p12(path:...)` or `TLSConfig.p12(data:...)`, with TLS version pinning |
 | `HttpResponse.switchProtocols` | `(Socket) -> Void`                | `@Sendable (HttpTransport) async -> Void`                        |
 | `WebSocketSession.socket`  | `Socket`                              | `transport: HttpTransport`; added `WebSocketSession.close()`     |
-| HTTPS                      | not supported                         | `TLSConfig.p12(path:password:)` → `start(_:tls:)`                |
 | Linux                      | supported                             | **not** supported — Darwin-only                                  |
 | iOS background suspend     | RUNNINGBOARD 0xdead10cc on socket hold | NWListener participates in system lifecycle                      |
 
@@ -141,7 +194,8 @@ sends a close frame and cancels the transport.
 
 ### Roadmap
 
-- Keychain identity loader as an alternative to P12 files
+- PEM cert + key loader as an alternative to P12 (will need temporary
+  Keychain assembly on iOS, deferred until a use case shows up)
 - Optional client-certificate verification (mTLS)
 - Evaluate HTTP/2 over `NWProtocolQUIC` if a use case shows up
 
