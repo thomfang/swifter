@@ -61,22 +61,55 @@ open class HttpServer: HttpServerIO {
 
     public var middleware = [@Sendable (HttpRequest) -> HttpResponse?]()
 
+    /// async middleware 链。每层可以返回 nil 表示放行,或返回 HttpResponse
+    /// 截胡(后续 middleware 和 route handler 都不执行)。
+    /// dispatch 会把整条链 + 路由 handler 包成一个 .async handler 交给 IO 层 await。
+    public var asyncMiddleware = [@Sendable (HttpRequest) async throws -> HttpResponse?]()
+
+    /// 便捷注册:append 一层 async middleware
+    public func use(_ middleware: @escaping @Sendable (HttpRequest) async throws -> HttpResponse?) {
+        asyncMiddleware.append(middleware)
+    }
+
     override open func dispatch(_ request: HttpRequest) -> ([String: String], HttpHandler) {
+        // 1) sync middleware 链:任一层命中直接同步返回(向后兼容上游)
         for layer in middleware {
             if let response = layer(request) {
                 return ([:], .sync { _ in response })
             }
         }
+
+        // 2) 路由 + 兜底
+        let routed: ([String: String], HttpHandler)
         if let result = router.route(request.method, path: request.path) {
-            return result
+            routed = result
+        } else if let asyncNotFound = self.notFoundAsyncHandler {
+            routed = ([:], .async(asyncNotFound))
+        } else if let notFoundHandler = self.notFoundHandler {
+            routed = ([:], .sync(notFoundHandler))
+        } else {
+            return super.dispatch(request)
         }
-        if let asyncNotFound = self.notFoundAsyncHandler {
-            return ([:], .async(asyncNotFound))
+
+        // 3) 如果挂了 async middleware,就把 routed handler 包一层:
+        //    依次 await 每个 middleware,有命中直接返回,否则继续走原 handler。
+        //    注意捕获 asyncMiddleware 当前快照,避免分发期间被并发修改影响行为
+        guard !asyncMiddleware.isEmpty else { return routed }
+
+        let chain = asyncMiddleware
+        let inner = routed.1
+        let wrapped: HttpHandler = .async { req in
+            for layer in chain {
+                if let response = try await layer(req) {
+                    return response
+                }
+            }
+            switch inner {
+            case .sync(let block):  return block(req)
+            case .async(let block): return try await block(req)
+            }
         }
-        if let notFoundHandler = self.notFoundHandler {
-            return ([:], .sync(notFoundHandler))
-        }
-        return super.dispatch(request)
+        return (routed.0, wrapped)
     }
 
     public struct MethodRoute {

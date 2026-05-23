@@ -98,6 +98,88 @@ final class HttpServerIOEndToEndTests: XCTestCase {
         XCTAssertEqual((response as? HTTPURLResponse)?.statusCode, 404)
     }
 
+    func testNotFoundAsyncHandler() async throws {
+        let server = HttpServer()
+        server.notFoundAsyncHandler = { req in
+            try await Task.sleep(nanoseconds: 50_000_000)
+            return .notFound(.text("custom 404 for \(req.path)"))
+        }
+        try await server.start(8210)
+        defer { server.stop() }
+
+        let url = URL(string: "http://localhost:8210/nowhere")!
+        let (data, response) = try await URLSession.shared.data(from: url)
+        XCTAssertEqual((response as? HTTPURLResponse)?.statusCode, 404)
+        XCTAssertEqual(String(data: data, encoding: .utf8), "custom 404 for /nowhere")
+    }
+
+    // MARK: - async middleware
+
+    /// middleware 返回 nil 时放行,后续 handler 跑,响应里能看到 handler 输出。
+    func testAsyncMiddlewarePassThrough() async throws {
+        let server = HttpServer()
+        let counter = AtomicInt()
+        server.use { _ in
+            counter.increment()
+            return nil
+        }
+        server.GET["/ping"] = { _ in .ok(.text("pong")) }
+        try await server.start(8211)
+        defer { server.stop() }
+
+        let url = URL(string: "http://localhost:8211/ping")!
+        let (data, response) = try await URLSession.shared.data(from: url)
+        XCTAssertEqual((response as? HTTPURLResponse)?.statusCode, 200)
+        XCTAssertEqual(String(data: data, encoding: .utf8), "pong")
+        XCTAssertEqual(counter.value, 1, "middleware should have run exactly once")
+    }
+
+    /// middleware 返回非 nil 时直接截胡,handler 不应再被调用。
+    func testAsyncMiddlewareShortCircuit() async throws {
+        let server = HttpServer()
+        let handlerHits = AtomicInt()
+        server.use { req in
+            if req.headers["x-auth"] == nil {
+                return .unauthorized(.text("missing x-auth"))
+            }
+            return nil
+        }
+        server.GET["/secret"] = { _ in
+            handlerHits.increment()
+            return .ok(.text("you got it"))
+        }
+        try await server.start(8212)
+        defer { server.stop() }
+
+        // 无 header -> 401,handler 不命中
+        var unauthRequest = URLRequest(url: URL(string: "http://localhost:8212/secret")!)
+        let (unauthData, unauthResp) = try await URLSession.shared.data(for: unauthRequest)
+        XCTAssertEqual((unauthResp as? HTTPURLResponse)?.statusCode, 401)
+        XCTAssertEqual(String(data: unauthData, encoding: .utf8), "missing x-auth")
+        XCTAssertEqual(handlerHits.value, 0)
+
+        // 带 header -> 放行
+        unauthRequest.setValue("token", forHTTPHeaderField: "x-auth")
+        let (okData, okResp) = try await URLSession.shared.data(for: unauthRequest)
+        XCTAssertEqual((okResp as? HTTPURLResponse)?.statusCode, 200)
+        XCTAssertEqual(String(data: okData, encoding: .utf8), "you got it")
+        XCTAssertEqual(handlerHits.value, 1)
+    }
+
+    /// 多层 middleware 顺序执行,且 throws 会被转成 500。
+    func testAsyncMiddlewareErrorBecomes500() async throws {
+        let server = HttpServer()
+        struct BoomError: Error {}
+        server.use { _ in throw BoomError() }
+        server.GET["/x"] = { _ in .ok(.text("ok")) }
+        try await server.start(8213)
+        defer { server.stop() }
+
+        let url = URL(string: "http://localhost:8213/x")!
+        let (_, response) = try await URLSession.shared.data(from: url)
+        XCTAssertEqual((response as? HTTPURLResponse)?.statusCode, 500)
+    }
+
     func testKeepAliveMultipleRequests() async throws {
         let server = HttpServer()
         let counter = AtomicInt()

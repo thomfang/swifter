@@ -57,4 +57,69 @@ final class TLSConfigTests: XCTestCase {
             XCTFail("Expected p12FileNotFound, got \(error)")
         }
     }
+
+    // MARK: - p12(data:) 数据流入口
+
+    /// 跟 testLoadValidP12 等价,但走 p12(data:) 入口模拟 keychain 读出的 bytes。
+    func testLoadValidP12FromData() throws {
+        let bytes = try Data(contentsOf: URL(fileURLWithPath: Self.fixturePath))
+        do {
+            let config = try TLSConfig.p12(data: bytes, password: Self.fixturePassword)
+            XCTAssertNotNil(config.tlsOptions)
+        } catch TLSConfigError.p12ImportFailed(let status) where status == -26276 {
+            throw XCTSkip("SecPKCS12Import returned -26276 (macOS environment-dependent); skipping P12 load test")
+        }
+    }
+
+    func testEmptyP12DataThrowsP12DataEmpty() {
+        do {
+            _ = try TLSConfig.p12(data: Data(), password: "x")
+            XCTFail("Expected p12DataEmpty")
+        } catch TLSConfigError.p12DataEmpty {
+            // expected
+        } catch {
+            XCTFail("Expected p12DataEmpty, got \(error)")
+        }
+    }
+
+    func testWrongPasswordOnDataThrowsImportFailed() throws {
+        let bytes = try Data(contentsOf: URL(fileURLWithPath: Self.fixturePath))
+        do {
+            _ = try TLSConfig.p12(data: bytes, password: "wrong-password")
+            XCTFail("Expected p12ImportFailed")
+        } catch TLSConfigError.p12ImportFailed {
+            // expected
+        } catch {
+            XCTFail("Expected p12ImportFailed, got \(error)")
+        }
+    }
+
+    // MARK: - TLSVersion parse
+
+    func testTLSVersionParseAcceptsCommonForms() {
+        XCTAssertEqual(TLSVersion.parse("1.2"), .v1_2)
+        XCTAssertEqual(TLSVersion.parse("1.3"), .v1_3)
+        XCTAssertEqual(TLSVersion.parse("TLSv1.2"), .v1_2)
+        XCTAssertEqual(TLSVersion.parse("tls1.3"), .v1_3)
+        XCTAssertEqual(TLSVersion.parse(" TLSV1.2 "), .v1_2)
+        XCTAssertNil(TLSVersion.parse("1.0")) // 已弃用,不支持
+        XCTAssertNil(TLSVersion.parse("garbage"))
+    }
+
+    // MARK: - min/max version 也能挂上去(只验证不抛错,运行时行为靠端到端测试)
+
+    func testLoadP12WithMinMaxVersion() throws {
+        let bytes = try Data(contentsOf: URL(fileURLWithPath: Self.fixturePath))
+        do {
+            let config = try TLSConfig.p12(
+                data: bytes,
+                password: Self.fixturePassword,
+                minVersion: .v1_3,
+                maxVersion: .v1_3
+            )
+            XCTAssertNotNil(config.tlsOptions)
+        } catch TLSConfigError.p12ImportFailed(let status) where status == -26276 {
+            throw XCTSkip("SecPKCS12Import returned -26276 (macOS environment-dependent)")
+        }
+    }
 }
