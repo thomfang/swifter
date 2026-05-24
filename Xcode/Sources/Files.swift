@@ -7,7 +7,7 @@
 
 import Foundation
 
-public func shareFile(_ path: String) -> ((HttpRequest) -> HttpResponse) {
+public func shareFile(_ path: String) -> (@Sendable (HttpRequest) -> HttpResponse) {
     return { _ in
         // fopen 在目录上不会失败 —— 它返回非 nil 但 fread 拿到空数据,会让客户端
         // 看到 200 + 空 body。在打开前显式排除目录,改返回 404
@@ -31,7 +31,7 @@ public func shareFile(_ path: String) -> ((HttpRequest) -> HttpResponse) {
     }
 }
 
-public func shareFilesFromDirectory(_ directoryPath: String, defaults: [String] = ["index.html", "default.html"]) -> ((HttpRequest) -> HttpResponse) {
+public func shareFilesFromDirectory(_ directoryPath: String, defaults: [String] = ["index.html", "default.html"]) -> (@Sendable (HttpRequest) -> HttpResponse) {
     return { request in
         guard let fileRelativePath = request.params.first else {
             return .notFound()
@@ -81,7 +81,7 @@ public func shareFilesFromDirectory(_ directoryPath: String, defaults: [String] 
     }
 }
 
-public func directoryBrowser(_ dir: String) -> ((HttpRequest) -> HttpResponse) {
+public func directoryBrowser(_ dir: String) -> (@Sendable (HttpRequest) -> HttpResponse) {
     return { request in
         guard let (_, value) = request.params.first else {
             return .notFound()
