@@ -20,7 +20,9 @@ public func websocket(
     binary: (@Sendable (WebSocketSession, [UInt8]) -> Void)? = nil,
     pong: (@Sendable (WebSocketSession, [UInt8]) -> Void)? = nil,
     connected: (@Sendable (WebSocketSession) -> Void)? = nil,
-    disconnected: (@Sendable (WebSocketSession) -> Void)? = nil
+    disconnected: (@Sendable (WebSocketSession) -> Void)? = nil,
+    // 延迟读取:在建连(创建 session)时求值,使 server 级配置对之后的连接生效,与注册顺序无关
+    maxPayloadSize: @escaping @Sendable () -> Int = { 16 * 1024 * 1024 }
 ) -> (@Sendable (HttpRequest) -> HttpResponse) {
     return { request in
         guard request.hasTokenForHeader("upgrade", token: "websocket") else {
@@ -34,6 +36,7 @@ public func websocket(
         }
         let protocolSessionClosure: @Sendable (HttpTransport) async -> Void = { transport in
             let session = WebSocketSession(transport)
+            session.maxPayloadSize = maxPayloadSize()
             // 分片状态(payload / fragmentedOpCode)是连接内单线程消费 —— readLoop 串行处理
             // 收到的每个 frame,因此用 class 包装规避 capture-by-var 在并发上下文中的告警
             let state = FragmentState()

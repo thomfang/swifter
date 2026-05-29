@@ -50,6 +50,13 @@ open class HttpServerIO: @unchecked Sendable {
     /// String representation of the IPv6 address to receive requests from.
     public var listenAddressIPv6: String?
 
+    /// 请求体上限(字节),建连时传给该连接的 HttpParser。默认 50MB。
+    public var maxRequestBodySize: Int = 50 * 1024 * 1024
+
+    /// WebSocket 单帧 / 分片消息累积上限(字节)。建连时由 websocket handler 读取,
+    /// 因此 start 时设定的值对之后建立的连接生效,与 registerWebsocket 的调用顺序无关。默认 16MB。
+    public var maxWebSocketPayloadSize: Int = 16 * 1024 * 1024
+
     /// 在用的 NWListener;state 切到 running 后非 nil
     private var listener: NWListener?
 
@@ -229,6 +236,7 @@ open class HttpServerIO: @unchecked Sendable {
 
     private func handleConnection(_ transport: HttpTransport) async throws {
         let parser = HttpParser()
+        parser.maxRequestBodySize = maxRequestBodySize
         while self.operating {
             let request: HttpRequest
             do {

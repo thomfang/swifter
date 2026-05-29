@@ -239,6 +239,21 @@ final class HttpServerIOEndToEndTests: XCTestCase {
         XCTAssertEqual(data, payload)
     }
 
+    /// #3 回归:start 时设的 maxRequestBodySize 必须传到该连接的 parser,超限回 413。
+    func testMaxRequestBodySizeReturns413() async throws {
+        let server = HttpServer()
+        server.maxRequestBodySize = 1024
+        server.POST["/echo"] = { req in .ok(.data(Data(req.body))) }
+        try await server.start(8217)
+        defer { server.stop() }
+
+        var request = URLRequest(url: URL(string: "http://localhost:8217/echo")!)
+        request.httpMethod = "POST"
+        let body = Data(repeating: 0x41, count: 2048)  // 2KB > 1KB 限制
+        let (_, response) = try await URLSession.shared.upload(for: request, from: body)
+        XCTAssertEqual((response as? HTTPURLResponse)?.statusCode, 413)
+    }
+
 }
 
 private final class AtomicInt: @unchecked Sendable {
