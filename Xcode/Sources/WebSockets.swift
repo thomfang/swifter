@@ -127,6 +127,9 @@ private extension WSReadLoop {
             frame.opcode = state.opcode
             if frame.fin {
                 state.payload.append(contentsOf: frame.payload)
+                guard state.payload.count <= session.maxPayloadSize else {
+                    throw WebSocketSession.WsError.protocolError("Fragmented message exceeds the maximum allowed size.")
+                }
                 frame.payload = state.payload
                 state.payload = []
                 state.opcode = .close
@@ -150,6 +153,9 @@ private extension WSReadLoop {
                     }
                 } else {
                     state.payload.append(contentsOf: frame.payload)
+                    guard state.payload.count <= session.maxPayloadSize else {
+                        throw WebSocketSession.WsError.protocolError("Fragmented message exceeds the maximum allowed size.")
+                    }
                     state.opcode = .text
                 }
             }
@@ -162,6 +168,9 @@ private extension WSReadLoop {
                     handleBinary(session, frame.payload)
                 } else {
                     state.payload.append(contentsOf: frame.payload)
+                    guard state.payload.count <= session.maxPayloadSize else {
+                        throw WebSocketSession.WsError.protocolError("Fragmented message exceeds the maximum allowed size.")
+                    }
                     state.opcode = .binary
                 }
             }
@@ -199,6 +208,10 @@ public final class WebSocketSession: @unchecked Sendable, Hashable, Equatable {
     public let transport: HttpTransport
     /// 保证 writeFrame 三段字节(opcode、长度、payload)原子 enqueue
     private let writeLock = NSLock()
+
+    /// 单帧 payload / 分片消息累积总量上限(字节)。防御 client 声明超大帧长
+    /// 或海量分片把 read buffer 撑爆 OOM。默认 16MB,可按需调整。
+    public var maxPayloadSize: Int = 16 * 1024 * 1024
 
     public init(_ transport: HttpTransport) {
         self.transport = transport
@@ -302,7 +315,7 @@ public final class WebSocketSession: @unchecked Sendable, Hashable, Equatable {
             let b1 = UInt64(try await transport.read())
             len = UInt64(littleEndian: b0 | b1)
         } else if len == 0x7F {
-            let b0 = UInt64(try await transport.read()) << 54
+            let b0 = UInt64(try await transport.read()) << 56
             let b1 = UInt64(try await transport.read()) << 48
             let b2 = UInt64(try await transport.read()) << 40
             let b3 = UInt64(try await transport.read()) << 32
@@ -318,6 +331,10 @@ public final class WebSocketSession: @unchecked Sendable, Hashable, Equatable {
         let m2 = try await transport.read()
         let m3 = try await transport.read()
         let mask = [m0, m1, m2, m3]
+        // 用 UInt64 比较避免 Int(len) 在超大 len 上溢出崩溃,同时拦截恶意超大帧
+        guard len <= UInt64(maxPayloadSize) else {
+            throw WsError.protocolError("Frame payload exceeds the maximum allowed size.")
+        }
         frm.payload = try await transport.read(length: Int(len))
         for index in 0..<len {
             frm.payload[Int(index)] ^= mask[Int(index % 4)]

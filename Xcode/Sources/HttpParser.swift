@@ -10,9 +10,15 @@ import Foundation
 enum HttpParserError: Error, Equatable {
     case invalidStatusLine(String)
     case negativeContentLength
+    /// 声明的 Content-Length 超过 maxRequestBodySize —— 调用方应回 413 并关连接
+    case requestBodyTooLarge(Int)
 }
 
 public class HttpParser {
+
+    /// 请求体上限(字节)。防御恶意/超大 Content-Length 把 read buffer 撑爆导致 OOM。
+    /// 默认 50MB,调用方可按需调整。
+    public var maxRequestBodySize: Int = 50 * 1024 * 1024
 
     public init() { }
 
@@ -45,6 +51,11 @@ public class HttpParser {
             // 防御:负长度会让上游 UnsafeMutableBufferPointer 越界,parser 直接拒绝
             guard contentLengthValue >= 0 else {
                 throw HttpParserError.negativeContentLength
+            }
+            // 防御:超大 Content-Length 会让 read(length:) 把 buffer 撑爆 OOM。
+            // 不读 body,直接抛错让 IO 层回 413 并关连接。
+            guard contentLengthValue <= maxRequestBodySize else {
+                throw HttpParserError.requestBodyTooLarge(contentLengthValue)
             }
             request.body = try await transport.read(length: contentLengthValue)
         }

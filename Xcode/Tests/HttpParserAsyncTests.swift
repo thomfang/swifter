@@ -101,6 +101,33 @@ final class HttpParserAsyncTests: XCTestCase {
         }
     }
 
+    func testOversizedContentLengthThrows() async {
+        // A2 回归:声明的 Content-Length 超过 maxRequestBodySize 应在读 body 前拒绝,
+        // 避免 read(length:) 把 buffer 撑爆 OOM。
+        do {
+            let parser = HttpParser()
+            parser.maxRequestBodySize = 1024
+            let transport = MockHttpTransport(
+                "POST / HTTP/1.1\r\nContent-Length: 2048\r\n\r\n"
+            )
+            _ = try await parser.readHttpRequest(transport)
+            XCTFail("Expected throw")
+        } catch HttpParserError.requestBodyTooLarge(let size) {
+            XCTAssertEqual(size, 2048)
+        } catch {
+            XCTFail("Unexpected error: \(error)")
+        }
+    }
+
+    func testBodyAtLimitIsAccepted() async throws {
+        // 边界:恰好等于上限应放行
+        let parser = HttpParser()
+        parser.maxRequestBodySize = 5
+        let transport = MockHttpTransport("POST / HTTP/1.1\r\nContent-Length: 5\r\n\r\nhello")
+        let req = try await parser.readHttpRequest(transport)
+        XCTAssertEqual(String(bytes: req.body, encoding: .utf8), "hello")
+    }
+
     func testBodyShorterThanContentLengthThrows() async {
         do {
             _ = try await parse("POST / HTTP/1.0\r\nContent-Length: 10\r\n\r\n")

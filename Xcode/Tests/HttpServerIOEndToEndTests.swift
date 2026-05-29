@@ -199,6 +199,46 @@ final class HttpServerIOEndToEndTests: XCTestCase {
             XCTAssertEqual(String(data: data, encoding: .utf8), "\(expectN)")
         }
     }
+
+    // MARK: - 流式写出回归(A1)
+
+    /// A1 回归:大内存 body 必须逐块流式写出且完整、按序送达。
+    /// 此前 respond 全量缓冲 + Data 二次拷贝,大 body 会 OOM(malloc 失败 trap)。
+    func testLargeResponseBodyStreaming() async throws {
+        let server = HttpServer()
+        let size = 8 * 1024 * 1024  // 8MB,远超单块 64KB,强制走多块流式
+        let payload = Data((0..<size).map { UInt8($0 & 0xFF) })
+        server.GET["/big"] = { _ in .ok(.data(payload, contentType: "application/octet-stream")) }
+        try await server.start(8214)
+        defer { server.stop() }
+
+        let url = URL(string: "http://localhost:8214/big")!
+        let (data, response) = try await URLSession.shared.data(from: url)
+        XCTAssertEqual((response as? HTTPURLResponse)?.statusCode, 200)
+        XCTAssertEqual(data.count, size)
+        XCTAssertEqual(data, payload, "streamed body must be byte-for-byte complete and ordered")
+    }
+
+    /// A1 回归:大文件经 shareFile 流式下载,完整且正确(对应崩溃栈的 file 写出路径)。
+    func testLargeFileStreaming() async throws {
+        let size = 4 * 1024 * 1024
+        let payload = Data((0..<size).map { UInt8($0 & 0xFF) })
+        let tmp = NSTemporaryDirectory() + "swifter_large_\(UUID().uuidString).bin"
+        try payload.write(to: URL(fileURLWithPath: tmp))
+        defer { try? FileManager.default.removeItem(atPath: tmp) }
+
+        let server = HttpServer()
+        server.GET["/file"] = shareFile(tmp)
+        try await server.start(8215)
+        defer { server.stop() }
+
+        let url = URL(string: "http://localhost:8215/file")!
+        let (data, response) = try await URLSession.shared.data(from: url)
+        XCTAssertEqual((response as? HTTPURLResponse)?.statusCode, 200)
+        XCTAssertEqual(data.count, size)
+        XCTAssertEqual(data, payload)
+    }
+
 }
 
 private final class AtomicInt: @unchecked Sendable {

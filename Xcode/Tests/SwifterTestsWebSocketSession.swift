@@ -88,4 +88,19 @@ class SwifterTestsWebSocketSession: XCTestCase {
             }
         }
     }
+
+    func testParserRejectsOversizedFramePayload() async {
+        // B2 回归:声明 payload 超过 maxPayloadSize 的帧应在读 payload 之前被拒,避免 OOM。
+        // fin=1 + text;mask=1 + len=126(16 位扩展长度);扩展长度 = 60000(0xEA60);mask 4 字节
+        let session = makeSession([0b1000_0001, 0b1111_1110, 0xEA, 0x60, 0, 0, 0, 0])
+        session.maxPayloadSize = 1024
+        do {
+            _ = try await session.readFrame()
+            XCTFail("Parser should reject frames whose payload exceeds maxPayloadSize.")
+        } catch WebSocketSession.WsError.protocolError {
+            // expected
+        } catch {
+            XCTFail("Expected protocolError, got \(error)")
+        }
+    }
 }

@@ -26,14 +26,18 @@ open class HttpServerIO: @unchecked Sendable {
         case stopped
     }
 
+    // NSLock 保护状态读写 —— 取代已废弃且不检查返回值(转换可被静默丢弃)的
+    // OSAtomicCompareAndSwapInt。start/stop 与连接 task 会并发读 state。
+    private let stateLock = NSLock()
     private var stateValue: Int32 = HttpServerIOState.stopped.rawValue
 
     public private(set) var state: HttpServerIOState {
         get {
+            stateLock.lock(); defer { stateLock.unlock() }
             return HttpServerIOState(rawValue: stateValue)!
         }
-        set(state) {
-            OSAtomicCompareAndSwapInt(self.state.rawValue, state.rawValue, &stateValue)
+        set {
+            stateLock.lock(); stateValue = newValue.rawValue; stateLock.unlock()
         }
     }
 
@@ -97,7 +101,12 @@ open class HttpServerIO: @unchecked Sendable {
             }
             semaphore.signal()
         }
-        semaphore.wait()
+        // 加超时兜底:startAsync 会在 .ready/.failed/.waiting 都 fulfill,正常应立即返回;
+        // 此处防御未知挂起,避免 JS 主线程调 start() 时永久阻塞 → watchdog 崩。
+        if semaphore.wait(timeout: .now() + .seconds(10)) == .timedOut {
+            self.stop()
+            throw HttpServerError.bindFailed("Server start timed out.")
+        }
         if let error = box.error {
             throw error
         }
@@ -137,6 +146,11 @@ open class HttpServerIO: @unchecked Sendable {
                 self?.resolvedPort = resolved
                 ready.fulfill(.success(()))
             case .failed(let error):
+                self?.state = .stopped
+                ready.fulfill(.failure(HttpServerError.bindFailed(error.localizedDescription)))
+            case .waiting(let error):
+                // 端口被占用 / 暂时无法监听。本机 server 不做无限重试 —— 直接报错,
+                // 避免 ready.wait() 永不兑现导致 sync start() 永久阻塞调用线程。
                 self?.state = .stopped
                 ready.fulfill(.failure(HttpServerError.bindFailed(error.localizedDescription)))
             case .cancelled:
@@ -195,7 +209,10 @@ open class HttpServerIO: @unchecked Sendable {
         connections[id] = transport
         connectionsLock.unlock()
 
-        conn.start(queue: listenerQueue)
+        // 每连接独立 queue —— 避免所有连接的 receive/send 回调串行化在共享 listenerQueue 上
+        // 造成的并发吞吐瓶颈(listener 自身仍用 listenerQueue)
+        let connQueue = DispatchQueue(label: "swifter.httpserverio.conn", qos: .userInitiated)
+        conn.start(queue: connQueue)
 
         Task.detached { [weak self] in
             do {
@@ -216,6 +233,13 @@ open class HttpServerIO: @unchecked Sendable {
             let request: HttpRequest
             do {
                 request = try await parser.readHttpRequest(transport)
+            } catch HttpParserError.requestBodyTooLarge {
+                // 声明的 Content-Length 超限 —— 不读 body,回 413 后关连接,避免 OOM
+                let resp = HttpResponse.raw(413, "Payload Too Large", nil) {
+                    try $0.write([UInt8]("Request body too large.".utf8))
+                }
+                _ = try? await respond(transport, response: resp, keepAlive: false)
+                return
             } catch {
                 // 客户端断开 / 报文异常,结束该连接
                 return
@@ -256,34 +280,57 @@ open class HttpServerIO: @unchecked Sendable {
 
     // MARK: - Response writing
 
+    /// 把 non-Sendable 值(如 content.write 闭包)安全带过 DispatchQueue 边界。
+    /// 我方保证:被包裹的闭包只在派发的 block 内调用一次,且其捕获的是不可变响应数据。
+    private final class UncheckedSendableBox<T>: @unchecked Sendable {
+        let value: T
+        init(_ value: T) { self.value = value }
+    }
+
+    /// 流式响应体写出器:把 sync 的 HttpResponseBodyWriter 调用逐块桥到 async transport。
+    /// 关键约束:本类型的 write 方法只能在 respond 派发的 libdispatch 全局 queue 线程上调用
+    /// (非 Swift 协作线程池),因为 writeBlocking 会同步阻塞当前线程等待该块送达协议栈。
     private struct InnerWriteContext: HttpResponseBodyWriter {
 
         let transport: HttpTransport
 
-        // HttpResponseBodyWriter 协议是 sync;这里只在 respond 内部使用,
-        // respond 自己负责把这些 write 包成 async write 任务。
-        // 实现方式:用一个内部 collector buffer,respond 写完后整体 await 写入。
-        let collector: BufferCollector
+        /// 单块上限 —— 常驻内存与响应体大小无关
+        private static let chunkSize = 64 * 1024
+
+        /// 阻塞写一块:在当前(dispatch)线程等待 transport.write 完成再返回。
+        /// transport.write 自身 await NWConnection 的 .contentProcessed,
+        /// 因此天然提供背压;此处只是把它从 sync 上下文驱动。内层 Task 跑在协作池
+        /// (此刻空闲 —— respond 已在 withCheckedContinuation 处挂起让出),不会死锁。
+        private func writeBlocking(_ chunk: ArraySlice<UInt8>) throws {
+            let sem = DispatchSemaphore(value: 0)
+            let box = ErrorBox()
+            Task {
+                do { try await transport.write(chunk) }
+                catch { box.error = error }
+                sem.signal()
+            }
+            sem.wait()
+            if let error = box.error { throw error }
+        }
 
         func write(_ file: String.File) throws {
-            // String.File 是 fread 包装,这里一段段读完后塞到 collector;
-            // respond 收尾时一次性 flush。
-            var chunk = [UInt8](repeating: 0, count: 64 * 1024)
+            // 逐 64KB 读盘、逐块流式写出 —— 从不把整文件读进内存(还原上游 sendfile 语义)
+            var chunk = [UInt8](repeating: 0, count: Self.chunkSize)
             while true {
                 let count = try file.read(&chunk)
                 if count <= 0 { break }
-                collector.append(Array(chunk[0..<count]))
+                try writeBlocking(ArraySlice(chunk[0..<count]))
                 if count < chunk.count { break }
             }
             file.close()
         }
 
         func write(_ data: [UInt8]) throws {
-            collector.append(data)
+            try writeChunked(ArraySlice(data))
         }
 
         func write(_ data: ArraySlice<UInt8>) throws {
-            collector.append(Array(data))
+            try writeChunked(data)
         }
 
         func write(_ data: NSData) throws {
@@ -291,20 +338,17 @@ open class HttpServerIO: @unchecked Sendable {
         }
 
         func write(_ data: Data) throws {
-            collector.append([UInt8](data))
+            try writeChunked(ArraySlice([UInt8](data)))
         }
-    }
 
-    /// 收集 sync HttpResponseBody.content writer 调用产生的字节,等 respond 一次性写。
-    final class BufferCollector {
-        private var buffer: [UInt8] = []
-        private let lock = NSLock()
-        func append(_ data: [UInt8]) {
-            lock.lock(); buffer.append(contentsOf: data); lock.unlock()
-        }
-        func drain() -> [UInt8] {
-            lock.lock(); let out = buffer; buffer.removeAll(keepingCapacity: false); lock.unlock()
-            return out
+        /// 把任意大小的内存 body 切成 ≤chunkSize 块逐块阻塞写,避免单次 Data(600MB) 之类的巨分配
+        private func writeChunked(_ data: ArraySlice<UInt8>) throws {
+            var idx = data.startIndex
+            while idx < data.endIndex {
+                let end = Swift.min(idx + Self.chunkSize, data.endIndex)
+                try writeBlocking(data[idx..<end])
+                idx = end
+            }
         }
     }
 
@@ -331,16 +375,28 @@ open class HttpServerIO: @unchecked Sendable {
         responseHeader.append("\r\n")
 
         // Some web-socket clients (Jetfire) want the header in a single packet —
-        // 集中后用一次 write 发出
+        // header 先 await 写出,在 body 之前;NWConnection.send FIFO 保证顺序
         try await transport.write(responseHeader)
 
         if let writeClosure = content.write {
-            let collector = BufferCollector()
-            let context = InnerWriteContext(transport: transport, collector: collector)
-            try writeClosure(context)
-            let bytes = collector.drain()
-            if !bytes.isEmpty {
-                try await transport.write(ArraySlice(bytes))
+            // HttpResponseBodyWriter 是 sync 协议,transport.write 是 async。
+            // 把 writeClosure 派发到 libdispatch 全局 queue(离开 Swift 协作线程池),
+            // 内部逐块阻塞写(InnerWriteContext)。这样:
+            //   - 响应体逐块流式写出,常驻内存 ≤ 64KB(不再全量缓冲 + 二次拷贝)
+            //   - transport.write 自身 await .contentProcessed,提供原生背压
+            //   - 阻塞发生在 dispatch 线程,不污染协作池(不会饥饿/死锁)
+            //   - 最后一块写完(continuation resume)才返回,保证 flush-before-close
+            let boxed = UncheckedSendableBox(writeClosure)
+            let context = InnerWriteContext(transport: transport)
+            try await withCheckedThrowingContinuation { (cont: CheckedContinuation<Void, Error>) in
+                DispatchQueue.global(qos: .userInitiated).async {
+                    do {
+                        try boxed.value(context)
+                        cont.resume()
+                    } catch {
+                        cont.resume(throwing: error)
+                    }
+                }
             }
         }
 

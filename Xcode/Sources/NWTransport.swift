@@ -61,18 +61,26 @@ public actor NWTransport: HttpTransport {
     }
 
     public func readLine() async throws -> String {
+        // 批量扫描 readBuffer 找 '\n',避免逐字节 read() + removeFirst() 的 O(n²)
+        // 与海量 actor 调度(长 header 行的 DoS 面)。CRLF:丢弃 '\r',以 '\n' 终止。
         var bytes: [UInt8] = []
         while true {
-            let byte = try await read()
-            // HTTP/1.1 以 CRLF 为行终止,这里跟现状 HttpParser 行为一致:
-            // 跳过 \r,以 \n 为终止符
-            if byte == 0x0A { // '\n'
+            if let nlIndex = readBuffer.firstIndex(of: 0x0A) {
+                var i = 0
+                while i < nlIndex {
+                    let b = readBuffer[i]
+                    if b != 0x0D { bytes.append(b) }
+                    i += 1
+                }
+                readBuffer.removeFirst(nlIndex + 1)
                 break
             }
-            if byte == 0x0D { // '\r'
-                continue
+            // 当前 buffer 内没有换行 —— 先把已有字节(去 '\r')转移,再拉更多
+            for b in readBuffer where b != 0x0D {
+                bytes.append(b)
             }
-            bytes.append(byte)
+            readBuffer.removeAll(keepingCapacity: true)
+            try await fillBuffer()
         }
         guard let str = String(bytes: bytes, encoding: .utf8) else {
             throw HttpTransportError.invalidData
