@@ -331,8 +331,9 @@ public final class WebSocketSession: @unchecked Sendable, Hashable, Equatable {
         let m2 = try await transport.read()
         let m3 = try await transport.read()
         let mask = [m0, m1, m2, m3]
-        // 用 UInt64 比较避免 Int(len) 在超大 len 上溢出崩溃,同时拦截恶意超大帧
-        guard len <= UInt64(maxPayloadSize) else {
+        // 用 UInt64 比较避免 Int(len) 在超大 len 上溢出崩溃,同时拦截恶意超大帧。
+        // max(0,) 防御:maxPayloadSize 是 public var,用户若误设负值,UInt64(负) 会崩。
+        guard len <= UInt64(max(0, maxPayloadSize)) else {
             throw WsError.protocolError("Frame payload exceeds the maximum allowed size.")
         }
         frm.payload = try await transport.read(length: Int(len))
