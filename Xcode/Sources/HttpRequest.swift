@@ -10,6 +10,10 @@ import Foundation
 public class HttpRequest {
 
     public var path: String = ""
+    /// 原始 request-target（请求行第二段，如 "/search?q=foo"），含 query string。
+    /// `path` 经 URLComponents 拆解后丢掉了 query；`target` 保留原样，供需要完整 URL
+    /// 的调用方（如 Node 语义的 req.url）使用。
+    public var target: String = ""
     public var queryParams: [(String, String)] = []
     public var method: String = ""
     public var headers: [String: String] = [:]

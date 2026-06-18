@@ -42,6 +42,8 @@ public class HttpParser {
         }
         let request = HttpRequest()
         request.method = statusLineTokens[0]
+        // 原始 request-target（含 query），原样保留供 req.url 等用；path/queryParams 仍按需拆解。
+        request.target = statusLineTokens[1]
         let encodedPath = statusLineTokens[1].addingPercentEncoding(withAllowedCharacters: .urlQueryAllowed) ?? statusLineTokens[1]
         let urlComponents = URLComponents(string: encodedPath)
         request.path = urlComponents?.path ?? ""

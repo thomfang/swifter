@@ -22,6 +22,7 @@ final class HttpParserAsyncTests: XCTestCase {
         let req = try await parse("GET /ping HTTP/1.1\r\n\r\n")
         XCTAssertEqual(req.method, "GET")
         XCTAssertEqual(req.path, "/ping")
+        XCTAssertEqual(req.target, "/ping")
         XCTAssertTrue(req.body.isEmpty)
     }
 
@@ -36,6 +37,8 @@ final class HttpParserAsyncTests: XCTestCase {
     func testParsesQueryParams() async throws {
         let req = try await parse("GET /search?q=foo&n=2 HTTP/1.1\r\n\r\n")
         XCTAssertEqual(req.path, "/search")
+        // target 保留完整 request-target（含 query），不像 path 被拆掉。
+        XCTAssertEqual(req.target, "/search?q=foo&n=2")
         let dict = Dictionary(uniqueKeysWithValues: req.queryParams)
         XCTAssertEqual(dict["q"], "foo")
         XCTAssertEqual(dict["n"], "2")
