@@ -377,7 +377,13 @@ open class HttpServerIO: @unchecked Sendable {
         }
 
         for (name, value) in response.headers() {
-            responseHeader.append("\(name): \(value)\r\n")
+            // 多值 header（典型 Set-Cookie，也含其它 array-valued header）：上层用 `\n`
+            // 连成多行 sentinel（`\n` 在 HTTP header 值里非法，故无歧义），这里按 `\n`
+            // 拆成多个独立 header 行——对齐标准/Node 的多 Set-Cookie 语义（逗号合并对
+            // Set-Cookie 非法）。无 `\n` 的普通值 components 返回单元素、行为不变。
+            for line in value.components(separatedBy: "\n") {
+                responseHeader.append("\(name): \(line)\r\n")
+            }
         }
 
         responseHeader.append("\r\n")

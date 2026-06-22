@@ -254,6 +254,53 @@ final class HttpServerIOEndToEndTests: XCTestCase {
         XCTAssertEqual((response as? HTTPURLResponse)?.statusCode, 413)
     }
 
+    /// 多值 header（`\n` sentinel）必须拆成多个独立 header 行 —— 典型 Set-Cookie。
+    /// URLSession 会把多 Set-Cookie 合并/吞进 cookie storage，故用裸 TCP 读原始响应字节验证。
+    func testMultiValueHeaderSplitsIntoSeparateLines() async throws {
+        let server = HttpServer()
+        server.GET["/multi"] = { _ in
+            .raw(200, "OK", ["Set-Cookie": "a=1; Path=/\nb=2; Path=/", "X-Single": "v"]) { _ in }
+        }
+        try await server.start(8218)
+        defer { server.stop() }
+
+        let raw = try await Self.rawHTTP(port: 8218, request: "GET /multi HTTP/1.0\r\nConnection: close\r\n\r\n")
+        let setCookieLines = raw.components(separatedBy: "\r\n").filter { $0.hasPrefix("Set-Cookie:") }
+        XCTAssertEqual(setCookieLines.count, 2, "expected two separate Set-Cookie lines, got:\n\(raw)")
+        XCTAssertTrue(setCookieLines.contains("Set-Cookie: a=1; Path=/"))
+        XCTAssertTrue(setCookieLines.contains("Set-Cookie: b=2; Path=/"))
+        // 无 `\n` 的普通 header 仍单行。
+        XCTAssertEqual(raw.components(separatedBy: "\r\n").filter { $0.hasPrefix("X-Single:") }.count, 1)
+    }
+
+    /// 裸 POSIX TCP 客户端：发原始请求、读全部响应字节为字符串（localhost 一来回）。
+    private static func rawHTTP(port: UInt16, request: String) async throws -> String {
+        try await Task.detached(priority: .userInitiated) {
+            let fd = socket(AF_INET, SOCK_STREAM, 0)
+            XCTAssertGreaterThanOrEqual(fd, 0)
+            defer { close(fd) }
+            var addr = sockaddr_in()
+            addr.sin_family = sa_family_t(AF_INET)
+            addr.sin_port = port.bigEndian
+            inet_pton(AF_INET, "127.0.0.1", &addr.sin_addr)
+            let rc = withUnsafePointer(to: &addr) { p in
+                p.withMemoryRebound(to: sockaddr.self, capacity: 1) {
+                    connect(fd, $0, socklen_t(MemoryLayout<sockaddr_in>.size))
+                }
+            }
+            XCTAssertEqual(rc, 0, "connect failed")
+            _ = request.withCString { send(fd, $0, strlen($0), 0) }
+            var out = Data()
+            var buf = [UInt8](repeating: 0, count: 65536)
+            while true {
+                let n = recv(fd, &buf, buf.count, 0)
+                if n <= 0 { break }
+                out.append(contentsOf: buf[0..<n])
+            }
+            return String(data: out, encoding: .utf8) ?? ""
+        }.value
+    }
+
 }
 
 private final class AtomicInt: @unchecked Sendable {
