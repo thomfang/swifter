@@ -26,18 +26,22 @@ open class HttpServerIO: @unchecked Sendable {
         case stopped
     }
 
-    // NSLock 保护状态读写 —— 取代已废弃且不检查返回值(转换可被静默丢弃)的
-    // OSAtomicCompareAndSwapInt。start/stop 与连接 task 会并发读 state。
-    private let stateLock = NSLock()
+    // Listener publication and connection admission share a short critical section.
+    // Readiness is awaited after releasing it, so stop never waits for a bind.
+    private let lifecycleLock = NSLock()
     private var stateValue: Int32 = HttpServerIOState.stopped.rawValue
+    private var stopEpoch: UInt64 = 0
+    private var attempt: ListenerAttempt?
+    private var retiringListeners: [UUID: NWListener] = [:]
+    private var pendingStarts: [UUID: PendingStart] = [:]
 
     public private(set) var state: HttpServerIOState {
         get {
-            stateLock.lock(); defer { stateLock.unlock() }
+            lifecycleLock.lock(); defer { lifecycleLock.unlock() }
             return HttpServerIOState(rawValue: stateValue)!
         }
         set {
-            stateLock.lock(); stateValue = newValue.rawValue; stateLock.unlock()
+            lifecycleLock.lock(); stateValue = newValue.rawValue; lifecycleLock.unlock()
         }
     }
 
@@ -57,18 +61,70 @@ open class HttpServerIO: @unchecked Sendable {
     /// 因此 start 时设定的值对之后建立的连接生效,与 registerWebsocket 的调用顺序无关。默认 16MB。
     public var maxWebSocketPayloadSize: Int = 16 * 1024 * 1024
 
-    /// 在用的 NWListener;state 切到 running 后非 nil
-    private var listener: NWListener?
-
-    /// 当前活跃的 transport 集合,stop() 时统一关掉
-    private let connectionsLock = NSLock()
+    /// All entries belong to the current attempt. Old callbacks cannot admit new entries.
     private var connections: [UUID: HttpTransport] = [:]
-
-    /// listener 的 dispatch queue
-    private let listenerQueue = DispatchQueue(label: "swifter.httpserverio.listener", qos: .userInitiated)
 
     /// listener 启动后报告的本地端口 —— start 完成时已经 ready,有值
     private var resolvedPort: UInt16?
+
+    struct ListenerLifecycleTestHooks: Sendable {
+        var beforeBegin: (@Sendable () -> Void)?
+        var beforeReady: (@Sendable (UUID) -> Void)?
+        var afterReady: (@Sendable (UUID) -> Void)?
+        var didCancelListener: (@Sendable (UUID) -> Void)?
+        var beforeCancellationReceipt: (@Sendable (UUID) -> Void)?
+        var didCreateListener: (@Sendable (UUID, NWListener) -> Void)?
+        var beforeSynchronousSignal: (@Sendable () -> Void)?
+        var beforeRequestDispatch: (@Sendable (UUID, String) -> Void)?
+        var didFinishConnection: (@Sendable (UUID) -> Void)?
+        var synchronousTimeout: DispatchTimeInterval?
+    }
+
+    private var testHooks: ListenerLifecycleTestHooks?
+    var listenerLifecycleTestHooks: ListenerLifecycleTestHooks? {
+        get { lifecycleLock.withLock { testHooks } }
+        set { lifecycleLock.withLock { testHooks = newValue } }
+    }
+
+    var pendingStartCount: Int {
+        lifecycleLock.withLock { (attempt?.requests.count ?? 0) + pendingStarts.count }
+    }
+
+    private final class StartRequest: @unchecked Sendable {
+        let id = UUID()
+        let completion = ListenerReadyAwaiter()
+        // Protected by lifecycleLock, including cancellation before admission.
+        var cancelled = false
+        weak var attempt: ListenerAttempt?
+    }
+
+    private final class ListenerAttempt: @unchecked Sendable {
+        let id = UUID()
+        let listener: NWListener
+        let queue = DispatchQueue(label: "swifter.httpserverio.listener", qos: .userInitiated)
+        var requests: [UUID: StartRequest] = [:]
+        var hasDeliveredStarter = false
+
+        init(listener: NWListener) { self.listener = listener }
+    }
+
+    private struct PendingStart {
+        let request: StartRequest
+        let epoch: UInt64
+        let port: in_port_t
+        let forceIPv4: Bool
+        let tls: TLSConfig?
+    }
+
+    private struct Shutdown {
+        let requests: [StartRequest]
+        let transports: [HttpTransport]
+
+        func finish(_ error: Error) {
+            for request in requests { request.completion.fulfill(.failure(error)) }
+            for transport in transports { transport.close() }
+        }
+    }
 
     public init() {}
 
@@ -77,6 +133,7 @@ open class HttpServerIO: @unchecked Sendable {
     }
 
     public func port() throws -> Int {
+        lifecycleLock.lock(); defer { lifecycleLock.unlock() }
         guard let resolvedPort = resolvedPort else {
             throw HttpServerError.notRunning
         }
@@ -84,6 +141,7 @@ open class HttpServerIO: @unchecked Sendable {
     }
 
     public func isIPv4() throws -> Bool {
+        lifecycleLock.lock(); defer { lifecycleLock.unlock() }
         // NWListener 同时接受 v4/v6;此处保留 API 形态以兼容旧调用,统一返回 forceIPv4 时的语义
         return forceIPv4Active
     }
@@ -97,26 +155,33 @@ open class HttpServerIO: @unchecked Sendable {
     public func start(_ port: in_port_t = 8080, forceIPv4: Bool = false, tls: TLSConfig? = nil) throws {
         let semaphore = DispatchSemaphore(value: 0)
         let box = ErrorBox()
+        let request = StartRequest()
         // sync 调用方可能在 main thread (UserInteractive QoS) 等 semaphore;
         // Task.detached 默认走 .medium,会触发 priority inversion 告警。
         // 把 Task 提升到 .userInitiated,与 sync caller 的优先级匹配。
-        Task.detached(priority: .userInitiated) { [box, self] in
+        let task = Task.detached(priority: .userInitiated) { [box, self] in
             do {
-                try await self.startAsync(port, forceIPv4: forceIPv4, tls: tls)
+                try await self.startOperation(request, port: port, forceIPv4: forceIPv4, tls: tls)
+                self.listenerLifecycleTestHooks?.beforeSynchronousSignal?()
             } catch {
+                self.cancel(request)
                 box.error = error
             }
             semaphore.signal()
         }
         // 加超时兜底:startAsync 会在 .ready/.failed/.waiting 都 fulfill,正常应立即返回;
         // 此处防御未知挂起,避免 JS 主线程调 start() 时永久阻塞 → watchdog 崩。
-        if semaphore.wait(timeout: .now() + .seconds(10)) == .timedOut {
-            self.stop()
+        let timeout = listenerLifecycleTestHooks?.synchronousTimeout ?? .seconds(10)
+        if semaphore.wait(timeout: .now() + timeout) == .timedOut {
+            // Cancel this caller's interest, never a newer listener or another waiter.
+            cancel(request)
+            task.cancel()
             throw HttpServerError.bindFailed("Server start timed out.")
         }
         if let error = box.error {
             throw error
         }
+        guard finish(request) else { throw CancellationError() }
     }
 
     /// 启动服务(async)。
@@ -124,81 +189,215 @@ open class HttpServerIO: @unchecked Sendable {
     ///   - port: 监听端口;0 表示交由系统分配
     ///   - forceIPv4: true 时强制 IPv4 bind;false 时允许双栈
     ///   - tls: 非 nil 时启用 HTTPS;由 TLSConfig 提供 server identity
+    /// Concurrent starts share the active listener and its original options. Cancelling
+    /// one pending caller leaves other callers intact. A restart waits for the previous
+    /// listener's native cancellation before binding again, including on the same port.
     public func startAsync(_ port: in_port_t = 8080, forceIPv4: Bool = false, tls: TLSConfig? = nil) async throws {
-        guard !self.operating else { return }
-        stop()
-        self.state = .starting
-        self.forceIPv4Active = forceIPv4
-
-        let params = HttpServerIO.makeParameters(forceIPv4: forceIPv4, tls: tls)
-        let endpointPort = NWEndpoint.Port(rawValue: port) ?? .any
-        let listener: NWListener
+        let request = StartRequest()
         do {
-            listener = try NWListener(using: params, on: endpointPort)
+            try await startOperation(request, port: port, forceIPv4: forceIPv4, tls: tls)
+            guard finish(request) else { throw CancellationError() }
         } catch {
-            self.state = .stopped
-            throw HttpServerError.bindFailed(error.localizedDescription)
-        }
-        self.listener = listener
-
-        listener.newConnectionHandler = { [weak self] conn in
-            self?.handleNewConnection(conn)
-        }
-
-        let ready = ListenerReadyAwaiter()
-        listener.stateUpdateHandler = { [weak self] state in
-            switch state {
-            case .ready:
-                let resolved = listener.port?.rawValue
-                self?.resolvedPort = resolved
-                ready.fulfill(.success(()))
-            case .failed(let error):
-                self?.state = .stopped
-                ready.fulfill(.failure(HttpServerError.bindFailed(error.localizedDescription)))
-            case .waiting(let error):
-                // 端口被占用 / 暂时无法监听。本机 server 不做无限重试 —— 直接报错,
-                // 避免 ready.wait() 永不兑现导致 sync start() 永久阻塞调用线程。
-                self?.state = .stopped
-                ready.fulfill(.failure(HttpServerError.bindFailed(error.localizedDescription)))
-            case .cancelled:
-                self?.state = .stopped
-            default:
-                break
-            }
-        }
-
-        listener.start(queue: listenerQueue)
-
-        do {
-            try await ready.wait()
-        } catch {
-            listener.cancel()
-            self.listener = nil
-            self.state = .stopped
+            cancel(request)
             throw error
         }
-        self.state = .running
+    }
+
+    private func startOperation(_ request: StartRequest, port: in_port_t,
+                                forceIPv4: Bool, tls: TLSConfig?) async throws {
+        try await withTaskCancellationHandler {
+            try Task.checkCancellation()
+            let epoch = lifecycleLock.withLock { stopEpoch }
+            listenerLifecycleTestHooks?.beforeBegin?()
+            begin(request, epoch: epoch, port: port, forceIPv4: forceIPv4, tls: tls)
+            try await request.completion.wait()
+            try Task.checkCancellation()
+        } onCancel: {
+            self.cancel(request)
+        }
     }
 
     /// 同步停机 —— 取消 listener、关闭所有连接、复位状态。
     public func stop() {
-        guard self.operating || self.state == .starting else { return }
-        self.state = .stopping
-
-        // 关掉所有活跃 transport(keep-alive / websocket 循环会感知 disconnected 退出)
-        connectionsLock.lock()
-        let snapshot = Array(connections.values)
-        connections.removeAll(keepingCapacity: true)
-        connectionsLock.unlock()
-        for transport in snapshot {
-            transport.close()
+        let shutdown = lifecycleLock.withLock { () -> Shutdown in
+            stopEpoch &+= 1
+            return detachAttempt()
         }
+        shutdown.finish(CancellationError())
+    }
 
-        listener?.cancel()
-        listener = nil
+    private func begin(_ request: StartRequest, epoch: UInt64, port: in_port_t,
+                       forceIPv4: Bool, tls: TLSConfig?) {
+        lifecycleLock.lock()
+        guard !request.cancelled, !Task.isCancelled, stopEpoch == epoch else {
+            pendingStarts[request.id] = nil
+            lifecycleLock.unlock()
+            request.completion.fulfill(.failure(CancellationError()))
+            return
+        }
+        guard retiringListeners.isEmpty else {
+            pendingStarts[request.id] = PendingStart(request: request, epoch: epoch,
+                port: port, forceIPv4: forceIPv4, tls: tls)
+            lifecycleLock.unlock()
+            return
+        }
+        pendingStarts[request.id] = nil
+        if let attempt {
+            request.attempt = attempt
+            attempt.requests[request.id] = request
+            let ready = stateValue == HttpServerIOState.running.rawValue
+            lifecycleLock.unlock()
+            if ready { request.completion.fulfill(.success(())) }
+            return
+        }
+        do {
+            let params = Self.makeParameters(forceIPv4: forceIPv4, tls: tls)
+            let listener = try NWListener(using: params, on: NWEndpoint.Port(rawValue: port) ?? .any)
+            let attempt = ListenerAttempt(listener: listener)
+            self.attempt = attempt
+            request.attempt = attempt
+            attempt.requests[request.id] = request
+            forceIPv4Active = forceIPv4
+            stateValue = HttpServerIOState.starting.rawValue
+            listener.newConnectionHandler = { [weak self, weak attempt] connection in
+                guard let self, let attempt else { connection.cancel(); return }
+                self.handleNewConnection(connection, attempt: attempt)
+            }
+            let attemptID = attempt.id
+            listener.stateUpdateHandler = { [weak self, weak attempt] state in
+                guard let self else { return }
+                let hooks = self.listenerLifecycleTestHooks
+                if case .cancelled = state {
+                    if let beforeReceipt = hooks?.beforeCancellationReceipt {
+                        DispatchQueue.global(qos: .userInitiated).async {
+                            beforeReceipt(attemptID)
+                            self.handleCancellationReceipt(attemptID)
+                            hooks?.didCancelListener?(attemptID)
+                        }
+                    } else {
+                        self.handleCancellationReceipt(attemptID)
+                        hooks?.didCancelListener?(attemptID)
+                    }
+                    return
+                }
+                guard let attempt else { return }
+                if case .ready = state, let beforeReady = hooks?.beforeReady {
+                    // Fault injection delays our publication, never Network's cancellation queue.
+                    DispatchQueue.global(qos: .userInitiated).async {
+                        beforeReady(attempt.id)
+                        self.handleListenerState(state, attempt: attempt)
+                        hooks?.afterReady?(attempt.id)
+                    }
+                } else {
+                    self.handleListenerState(state, attempt: attempt)
+                }
+            }
+            listener.start(queue: attempt.queue)
+            let didCreate = testHooks?.didCreateListener
+            lifecycleLock.unlock()
+            didCreate?(attempt.id, listener)
+        } catch {
+            lifecycleLock.unlock()
+            request.completion.fulfill(.failure(HttpServerError.bindFailed(error.localizedDescription)))
+        }
+    }
+
+    private func cancel(_ request: StartRequest) {
+        lifecycleLock.lock()
+        request.cancelled = true
+        pendingStarts[request.id] = nil
+        var shutdown: Shutdown?
+        if let owner = request.attempt, attempt === owner {
+            owner.requests[request.id] = nil
+            request.attempt = nil
+            if owner.requests.isEmpty && !owner.hasDeliveredStarter {
+                shutdown = detachAttempt()
+            }
+        }
+        lifecycleLock.unlock()
+        request.completion.fulfill(.failure(CancellationError()))
+        shutdown?.finish(CancellationError())
+    }
+
+    /// A sync caller acknowledges only after receiving its semaphore signal.
+    private func finish(_ request: StartRequest) -> Bool {
+        lifecycleLock.withLock {
+            guard !request.cancelled, let owner = request.attempt, attempt === owner,
+                  stateValue == HttpServerIOState.running.rawValue else { return false }
+            owner.hasDeliveredStarter = true
+            owner.requests[request.id] = nil
+            request.attempt = nil
+            return true
+        }
+    }
+
+    private func handleListenerState(_ state: NWListener.State, attempt owner: ListenerAttempt) {
+        lifecycleLock.lock()
+        guard attempt === owner else { lifecycleLock.unlock(); return }
+        switch state {
+        case .ready:
+            guard stateValue == HttpServerIOState.starting.rawValue else {
+                lifecycleLock.unlock()
+                return
+            }
+            guard let port = owner.listener.port else {
+                let shutdown = detachAttempt()
+                lifecycleLock.unlock()
+                shutdown.finish(HttpServerError.notRunning)
+                return
+            }
+            resolvedPort = port.rawValue
+            stateValue = HttpServerIOState.running.rawValue
+            let requests = Array(owner.requests.values)
+            lifecycleLock.unlock()
+            for request in requests { request.completion.fulfill(.success(())) }
+        case .waiting(let error), .failed(let error):
+            let shutdown = detachAttempt()
+            lifecycleLock.unlock()
+            shutdown.finish(HttpServerError.bindFailed(error.localizedDescription))
+        default:
+            lifecycleLock.unlock()
+        }
+    }
+
+    private func handleCancellationReceipt(_ id: UUID) {
+        lifecycleLock.lock()
+        let shutdown = attempt?.id == id ? detachAttempt(cancelListener: false) : nil
+        retiringListeners[id] = nil
+        let pending = retiringListeners.isEmpty ? Array(pendingStarts.values) : []
+        // Keep each request discoverable by stop until begin moves it to an attempt.
+        lifecycleLock.unlock()
+        shutdown?.finish(CancellationError())
+        for next in pending {
+            begin(next.request, epoch: next.epoch, port: next.port,
+                  forceIPv4: next.forceIPv4, tls: next.tls)
+        }
+    }
+
+    /// Must be called with lifecycleLock held. NWListener.cancel does not wait for readiness.
+    private func detachAttempt(cancelListener: Bool = true) -> Shutdown {
+        let requests = (attempt.map { Array($0.requests.values) } ?? [])
+            + pendingStarts.values.map(\.request)
+        pendingStarts.removeAll()
+        for request in requests {
+            request.cancelled = true
+            request.attempt = nil
+        }
+        attempt?.requests.removeAll()
+        if cancelListener, let attempt {
+            retiringListeners[attempt.id] = attempt.listener
+            attempt.listener.cancel()
+        }
+        attempt = nil
         resolvedPort = nil
+        stateValue = HttpServerIOState.stopped.rawValue
+        let transports = Array(connections.values)
+        connections.removeAll()
+        return Shutdown(requests: requests, transports: transports)
+    }
 
-        self.state = .stopped
+    private func isRunning(_ owner: ListenerAttempt) -> Bool {
+        lifecycleLock.withLock { attempt === owner && stateValue == HttpServerIOState.running.rawValue }
     }
 
     /// 默认 dispatch:返回 404。子类 HttpServer 覆盖。
@@ -208,36 +407,41 @@ open class HttpServerIO: @unchecked Sendable {
 
     // MARK: - Connection lifecycle
 
-    private func handleNewConnection(_ conn: NWConnection) {
+    private func handleNewConnection(_ conn: NWConnection, attempt owner: ListenerAttempt) {
+        lifecycleLock.lock()
+        guard attempt === owner, stateValue == HttpServerIOState.running.rawValue else {
+            lifecycleLock.unlock()
+            conn.cancel()
+            return
+        }
         let id = UUID()
         let transport = NWTransport(conn)
-
-        connectionsLock.lock()
         connections[id] = transport
-        connectionsLock.unlock()
 
         // 每连接独立 queue —— 避免所有连接的 receive/send 回调串行化在共享 listenerQueue 上
         // 造成的并发吞吐瓶颈(listener 自身仍用 listenerQueue)
         let connQueue = DispatchQueue(label: "swifter.httpserverio.conn", qos: .userInitiated)
         conn.start(queue: connQueue)
+        lifecycleLock.unlock()
 
         Task.detached { [weak self] in
             do {
-                try await self?.handleConnection(transport)
+                try await self?.handleConnection(transport, attempt: owner)
             } catch {
                 // disconnected/EOF 是常态,无需打印
             }
-            self?.connectionsLock.lock()
-            self?.connections.removeValue(forKey: id)
-            self?.connectionsLock.unlock()
+            if let self {
+                _ = self.lifecycleLock.withLock { self.connections.removeValue(forKey: id) }
+                self.listenerLifecycleTestHooks?.didFinishConnection?(owner.id)
+            }
             transport.close()
         }
     }
 
-    private func handleConnection(_ transport: HttpTransport) async throws {
+    private func handleConnection(_ transport: HttpTransport, attempt owner: ListenerAttempt) async throws {
         let parser = HttpParser()
         parser.maxRequestBodySize = maxRequestBodySize
-        while self.operating {
+        while isRunning(owner) {
             let request: HttpRequest
             do {
                 request = try await parser.readHttpRequest(transport)
@@ -246,12 +450,14 @@ open class HttpServerIO: @unchecked Sendable {
                 let resp = HttpResponse.raw(413, "Payload Too Large", nil) {
                     try $0.write([UInt8]("Request body too large.".utf8))
                 }
-                _ = try? await respond(transport, response: resp, keepAlive: false)
+                if isRunning(owner) { _ = try? await respond(transport, response: resp, keepAlive: false) }
                 return
             } catch {
                 // 客户端断开 / 报文异常,结束该连接
                 return
             }
+            listenerLifecycleTestHooks?.beforeRequestDispatch?(owner.id, request.path)
+            guard isRunning(owner) else { return }
             request.address = transport.peername
             let (params, handler) = self.dispatch(request)
             request.params = params
@@ -270,14 +476,14 @@ open class HttpServerIO: @unchecked Sendable {
 
             var keepConnection = parser.supportsKeepAlive(request.headers)
             do {
-                if self.operating {
+                if isRunning(owner) {
                     keepConnection = try await respond(transport, response: response, keepAlive: keepConnection)
                 }
             } catch {
                 print("Failed to send response: \(error)")
             }
 
-            if let session = response.transportSession() {
+            if let session = response.transportSession(), isRunning(owner) {
                 delegate?.transportConnectionReceived(transport)
                 await session(transport)
                 return
@@ -456,18 +662,14 @@ private final class ListenerReadyAwaiter: @unchecked Sendable {
 
     func fulfill(_ r: Result<Void, Error>) {
         lock.lock()
-        if let waiter = waiter {
-            self.waiter = nil
-            lock.unlock()
-            switch r {
-            case .success: waiter.resume()
-            case .failure(let e): waiter.resume(throwing: e)
-            }
-        } else if result == nil {
-            result = r
-            lock.unlock()
-        } else {
-            lock.unlock()
+        guard result == nil else { lock.unlock(); return }
+        result = r
+        let waiter = self.waiter
+        self.waiter = nil
+        lock.unlock()
+        switch r {
+        case .success: waiter?.resume()
+        case .failure(let error): waiter?.resume(throwing: error)
         }
     }
 
@@ -475,7 +677,6 @@ private final class ListenerReadyAwaiter: @unchecked Sendable {
         try await withCheckedThrowingContinuation { (cont: CheckedContinuation<Void, Error>) in
             lock.lock()
             if let result = result {
-                self.result = nil
                 lock.unlock()
                 switch result {
                 case .success: cont.resume()
