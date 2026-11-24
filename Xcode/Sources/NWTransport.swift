@@ -16,12 +16,42 @@ public actor NWTransport: HttpTransport {
     private let connection: NWConnection
     private var readBuffer: [UInt8] = []
     private var isClosed = false
+    private var closeObserver: (@Sendable () -> Void)?
 
     /// 一次 receive 最大字节数,够大可以减少 read 单字节场景的 callback 次数
     private static let receiveChunk = 64 * 1024
 
     public init(_ connection: NWConnection) {
         self.connection = connection
+    }
+
+    public nonisolated var remoteEndpoint: NWEndpoint { connection.endpoint }
+    public nonisolated var localEndpoint: NWEndpoint? { connection.currentPath?.localEndpoint }
+
+    public func observeClose(_ onClose: @escaping @Sendable () -> Void) {
+        switch connection.state {
+        case .failed, .cancelled: onClose(); return
+        default: break
+        }
+        closeObserver = onClose
+        connection.stateUpdateHandler = { [weak self] state in
+            switch state {
+            case .failed, .cancelled:
+                Task { await self?.notifyClosed() }
+            default:
+                break
+            }
+        }
+        switch connection.state {
+        case .failed, .cancelled: notifyClosed()
+        default: break
+        }
+    }
+
+    private func notifyClosed() {
+        let observer = closeObserver
+        closeObserver = nil
+        observer?()
     }
 
     public nonisolated var peername: String? {
@@ -58,6 +88,34 @@ public actor NWTransport: HttpTransport {
         let out = Array(readBuffer.prefix(length))
         readBuffer.removeFirst(length)
         return out
+    }
+
+    /// Reads available bytes without waiting for the entire requested count.
+    public func read(upTo count: Int) async throws -> Data {
+        guard count > 0 else { throw HttpTransportError.invalidData }
+        if readBuffer.isEmpty { try await fillBuffer() }
+        let size = min(count, readBuffer.count)
+        let data = Data(readBuffer.prefix(size))
+        readBuffer.removeFirst(size)
+        return data
+    }
+
+    /// Reads one bounded HTTP line and verifies the wire CRLF delimiter.
+    public func readHTTPLine(limit: Int) async throws -> [UInt8] {
+        guard limit > 0 else { throw HttpTransportError.invalidData }
+        var line: [UInt8] = []
+        while true {
+            let newline = readBuffer.firstIndex(of: 0x0a)
+            let count = newline ?? readBuffer.count
+            guard count <= limit - line.count else { throw HttpTransportError.invalidData }
+            line.append(contentsOf: readBuffer.prefix(count))
+            readBuffer.removeFirst(count + (newline == nil ? 0 : 1))
+            if newline != nil {
+                guard line.popLast() == 0x0d, !line.contains(0x0d) else { throw HttpTransportError.invalidData }
+                return line
+            }
+            try await fillBuffer()
+        }
     }
 
     public func readLine() async throws -> String {

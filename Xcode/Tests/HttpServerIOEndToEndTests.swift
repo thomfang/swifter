@@ -12,6 +12,38 @@ import XCTest
 
 final class HttpServerIOEndToEndTests: XCTestCase {
 
+    func testOptInConnectionHandlerFinishesAfterListenerStopsAccepting() async throws {
+        let server = HttpServer()
+        server.listenAddressIPv4 = "127.0.0.1"
+        server.httpConnectionHandler = { [weak server] transport in
+            do {
+                let requestLine = try await transport.readHTTPLine(limit: 64)
+                XCTAssertEqual(String(decoding: requestLine, as: UTF8.self), "POST /drain HTTP/1.1")
+                while try await !transport.readHTTPLine(limit: 1024).isEmpty {}
+                server?.stopAcceptingConnections()
+                var body = Data()
+                while body.count < 5 { body.append(try await transport.read(upTo: 5 - body.count)) }
+                try await transport.write("HTTP/1.1 200 OK\r\nContent-Length: 5\r\nConnection: close\r\n\r\n")
+                try await transport.write(body)
+            } catch { XCTFail("Owned connection failed: \(error)") }
+        }
+        try await server.startAsync(0, forceIPv4: true)
+        defer { server.stop() }
+
+        let configuration = URLSessionConfiguration.ephemeral
+        configuration.timeoutIntervalForRequest = 3
+        let session = URLSession(configuration: configuration)
+        defer { session.invalidateAndCancel() }
+        let url = URL(string: "http://127.0.0.1:\(try server.port())/drain")!
+        var request = URLRequest(url: url)
+        request.httpMethod = "POST"
+        request.httpBody = Data("hello".utf8)
+        let (body, response) = try await session.data(for: request)
+        XCTAssertEqual((response as? HTTPURLResponse)?.statusCode, 200)
+        XCTAssertEqual(body, Data("hello".utf8))
+        XCTAssertThrowsError(try server.port())
+    }
+
     func testSyncHandlerEndToEnd() async throws {
         let server = HttpServer()
         server.GET["/ping"] = { _ in .ok(.text("pong!")) }

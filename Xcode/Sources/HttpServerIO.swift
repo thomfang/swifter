@@ -54,6 +54,13 @@ open class HttpServerIO: @unchecked Sendable {
     /// String representation of the IPv6 address to receive requests from.
     public var listenAddressIPv6: String?
 
+    /// An opt-in connection handler for consumers that own HTTP framing. Set before starting.
+    public var httpConnectionHandler: (@Sendable (NWTransport) async -> Void)? {
+        get { lifecycleLock.withLock { connectionHandler } }
+        set { lifecycleLock.withLock { connectionHandler = newValue } }
+    }
+    private var connectionHandler: (@Sendable (NWTransport) async -> Void)?
+
     /// 请求体上限(字节),建连时传给该连接的 HttpParser。默认 50MB。
     public var maxRequestBodySize: Int = 50 * 1024 * 1024
 
@@ -252,7 +259,12 @@ open class HttpServerIO: @unchecked Sendable {
         }
         do {
             let params = Self.makeParameters(forceIPv4: forceIPv4, tls: tls)
-            let listener = try NWListener(using: params, on: NWEndpoint.Port(rawValue: port) ?? .any)
+            let endpointPort = NWEndpoint.Port(rawValue: port) ?? .any
+            if connectionHandler != nil,
+               let address = forceIPv4 ? listenAddressIPv4 : listenAddressIPv6 {
+                params.requiredLocalEndpoint = .hostPort(host: NWEndpoint.Host(address), port: endpointPort)
+            }
+            let listener = try NWListener(using: params, on: endpointPort)
             let attempt = ListenerAttempt(listener: listener)
             self.attempt = attempt
             request.attempt = attempt
@@ -297,8 +309,9 @@ open class HttpServerIO: @unchecked Sendable {
             lifecycleLock.unlock()
             didCreate?(attempt.id, listener)
         } catch {
+            let failure = Self.bindError(error, reportsAddressInUse: connectionHandler != nil)
             lifecycleLock.unlock()
-            request.completion.fulfill(.failure(HttpServerError.bindFailed(error.localizedDescription)))
+            request.completion.fulfill(.failure(failure))
         }
     }
 
@@ -352,9 +365,10 @@ open class HttpServerIO: @unchecked Sendable {
             lifecycleLock.unlock()
             for request in requests { request.completion.fulfill(.success(())) }
         case .waiting(let error), .failed(let error):
+            let failure = Self.bindError(error, reportsAddressInUse: connectionHandler != nil)
             let shutdown = detachAttempt()
             lifecycleLock.unlock()
-            shutdown.finish(HttpServerError.bindFailed(error.localizedDescription))
+            shutdown.finish(failure)
         default:
             lifecycleLock.unlock()
         }
@@ -375,7 +389,7 @@ open class HttpServerIO: @unchecked Sendable {
     }
 
     /// Must be called with lifecycleLock held. NWListener.cancel does not wait for readiness.
-    private func detachAttempt(cancelListener: Bool = true) -> Shutdown {
+    private func detachAttempt(cancelListener: Bool = true, closeConnections: Bool = true) -> Shutdown {
         let requests = (attempt.map { Array($0.requests.values) } ?? [])
             + pendingStarts.values.map(\.request)
         pendingStarts.removeAll()
@@ -391,9 +405,18 @@ open class HttpServerIO: @unchecked Sendable {
         attempt = nil
         resolvedPort = nil
         stateValue = HttpServerIOState.stopped.rawValue
-        let transports = Array(connections.values)
-        connections.removeAll()
+        let transports = closeConnections ? Array(connections.values) : []
+        if closeConnections { connections.removeAll() }
         return Shutdown(requests: requests, transports: transports)
+    }
+
+    /// End listener admission while leaving the opt-in handler's accepted connections alive.
+    public func stopAcceptingConnections() {
+        let shutdown = lifecycleLock.withLock { () -> Shutdown in
+            stopEpoch &+= 1
+            return detachAttempt(closeConnections: connectionHandler == nil)
+        }
+        shutdown.finish(CancellationError())
     }
 
     private func isRunning(_ owner: ListenerAttempt) -> Bool {
@@ -417,6 +440,7 @@ open class HttpServerIO: @unchecked Sendable {
         let id = UUID()
         let transport = NWTransport(conn)
         connections[id] = transport
+        let handler = connectionHandler
 
         // 每连接独立 queue —— 避免所有连接的 receive/send 回调串行化在共享 listenerQueue 上
         // 造成的并发吞吐瓶颈(listener 自身仍用 listenerQueue)
@@ -426,7 +450,8 @@ open class HttpServerIO: @unchecked Sendable {
 
         Task.detached { [weak self] in
             do {
-                try await self?.handleConnection(transport, attempt: owner)
+                if let handler { await handler(transport) }
+                else { try await self?.handleConnection(transport, attempt: owner) }
             } catch {
                 // disconnected/EOF 是常态,无需打印
             }
@@ -625,6 +650,11 @@ open class HttpServerIO: @unchecked Sendable {
 
     // MARK: - NWParameters factory
 
+    private static func bindError(_ error: Error, reportsAddressInUse: Bool) -> HttpServerError {
+        if reportsAddressInUse, let error = error as? NWError, case .posix(.EADDRINUSE) = error { return .addressInUse }
+        return .bindFailed(error.localizedDescription)
+    }
+
     private static func makeParameters(forceIPv4: Bool, tls: TLSConfig?) -> NWParameters {
         let params: NWParameters
         if let tls = tls {
@@ -645,6 +675,7 @@ open class HttpServerIO: @unchecked Sendable {
 
 public enum HttpServerError: Error, Sendable {
     case bindFailed(String)
+    case addressInUse
     case notRunning
 }
 
